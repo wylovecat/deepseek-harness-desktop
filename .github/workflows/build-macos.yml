@@ -20,16 +20,18 @@ on:
         required: false
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD:
         required: false
+      # fork 或没有 Apple 开发者账号的仓库不会配置这些凭据：此时降级为未签名构建，
+      # 而不是让整个 macOS job 失败。
       APPLE_CERTIFICATE:
-        required: true
+        required: false
       APPLE_CERTIFICATE_PASSWORD:
-        required: true
+        required: false
       APPLE_ID:
-        required: true
+        required: false
       APPLE_PASSWORD:
-        required: true
+        required: false
       APPLE_TEAM_ID:
-        required: true
+        required: false
 
 permissions:
   contents: read
@@ -70,7 +72,7 @@ jobs:
 
       - name: Setup Xcode
         if: steps.check.outputs.should_run == 'true'
-        uses: $/.github/actions/setup-xcode
+        uses: ./.github/actions/setup-xcode
 
       - name: Setup Node.js and pnpm
         if: steps.check.outputs.should_run == 'true'
@@ -93,7 +95,14 @@ jobs:
           STAMP_VERSION: ${{ inputs.version }}
         run: node scripts/stamp-version.mjs "$STAMP_VERSION"
 
-      - name: Validate signing secrets
+      # 签名凭据齐备时走 Developer ID 签名 + 公证；一项都没有时降级为未签名构建。
+      # 只配了一部分视为配置错误——那通常意味着有人填错或漏填，静默产出未签名包更难排查。
+      #
+      # 注意：这里用 GITHUB_ENV 而不是在后续步骤里直接写 `APPLE_X: ${{ secrets.X }}`。
+      # tauri 用 `var_os()` 判断变量「是否存在」，空字符串同样算存在，会被当成已提供
+      # 证书去导入并失败；所以未签名分支必须让这些变量**完全不存在**。
+      - name: Detect signing credentials
+        id: signing
         if: steps.check.outputs.should_run == 'true'
         shell: bash
         env:
@@ -107,25 +116,36 @@ jobs:
           for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
             [ -z "${!name}" ] && missing+=("$name")
           done
+
+          if [ "${#missing[@]}" -eq 5 ]; then
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Apple signing credentials configured; building an unsigned macOS bundle. macOS will require right-click → Open on first launch."
+            exit 0
+          fi
+
           if [ "${#missing[@]}" -ne 0 ]; then
-            echo "::error::Missing macOS signing secrets: ${missing[*]}"
+            echo "::error::Incomplete macOS signing credentials, missing: ${missing[*]}. Configure all five or none."
             exit 1
           fi
+
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "APPLE_CERTIFICATE=$APPLE_CERTIFICATE"
+            echo "APPLE_CERTIFICATE_PASSWORD=$APPLE_CERTIFICATE_PASSWORD"
+            echo "APPLE_ID=$APPLE_ID"
+            echo "APPLE_PASSWORD=$APPLE_PASSWORD"
+            echo "APPLE_TEAM_ID=$APPLE_TEAM_ID"
+          } >> "$GITHUB_ENV"
 
       - name: Build package
         if: steps.check.outputs.should_run == 'true'
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: pnpm tauri build ${{ inputs.version != '' && '--config src-tauri/tauri.nightly.conf.json' || '' }} --target ${{ matrix.target }}
 
       - name: Verify signature and notarization
-        if: steps.check.outputs.should_run == 'true'
+        if: steps.check.outputs.should_run == 'true' && steps.signing.outputs.signed == 'true'
         shell: bash
         run: |
           app_path="$(find "src-tauri/target/${{ matrix.target }}/release/bundle/macos" -type d -name '*.app' -print -quit)"
@@ -136,6 +156,19 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$app_path"
           xcrun stapler validate "$app_path"
           spctl --assess --type execute --verbose=4 "$app_path"
+
+      # 未签名构建仍要确认产物存在：后面的 upload 只在 dmg 缺失时才失败，
+      # 这里先确认 .app 打出来了，避免把一个空 bundle 当成成功。
+      - name: Verify unsigned bundle
+        if: steps.check.outputs.should_run == 'true' && steps.signing.outputs.signed != 'true'
+        shell: bash
+        run: |
+          app_path="$(find "src-tauri/target/${{ matrix.target }}/release/bundle/macos" -type d -name '*.app' -print -quit)"
+          if [ -z "$app_path" ]; then
+            echo '::error::Built macOS app bundle was not found'
+            exit 1
+          fi
+          echo "::notice::Unsigned build (no Apple credentials configured): $app_path"
 
       - name: Normalize release asset names
         if: steps.check.outputs.should_run == 'true'
