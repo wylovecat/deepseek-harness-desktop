@@ -78,6 +78,36 @@ function runDetect(workflow: string, credentials: Partial<Record<(typeof APPLE_S
 
 const complete = Object.fromEntries(APPLE_SECRETS.map(name => [name, `value-of-${name}`]))
 
+/**
+ * 按 GitHub 的 GITHUB_ENV 格式解析：`NAME=value` 或 `NAME<<DELIMITER` 多行形式。
+ * 后者用于证书这类含换行的值——单行形式只会保留第一行。runner 按行收集后用
+ * `\n` 拼接，因此值里不含结尾换行。
+ */
+function parseEnvFile(source: string): Record<string, string> {
+  const parsed: Record<string, string> = {}
+  const lines = source.split('\n')
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]
+    const heredoc = line.match(/^([^<=]+)<<(.+)$/)
+    if (heredoc) {
+      const [, name, delimiter] = heredoc
+      const body: string[] = []
+      index += 1
+      while (index < lines.length && lines[index] !== delimiter)
+        body.push(lines[index++])
+      parsed[name] = body.join('\n')
+      continue
+    }
+    const assignment = line.match(/^([^=]+)=(.*)$/)
+    if (assignment)
+      parsed[assignment[1]] = assignment[2]
+  }
+  return parsed
+}
+
+/** `base64` 默认每 76 列折行，证书在多行形式下才不会被截断。 */
+const multilineCertificate = ['-----BEGIN CERTIFICATE-----', 'MIIBszCCAVmgAwIBAgIU', '-----END CERTIFICATE-----'].join('\n')
+
 describe('macOS signing credential fallback', () => {
   it.each(WORKFLOWS)('%s declares every Apple secret as optional', (workflow) => {
     const source = readSource(workflow)
@@ -98,8 +128,16 @@ describe('macOS signing credential fallback', () => {
     const result = runDetect(workflow, complete)
     expect(result.status).toBe(0)
     expect(result.output).toContain('signed=true')
-    for (const name of APPLE_SECRETS)
-      expect(result.env).toContain(`${name}=value-of-${name}`)
+    expect(parseEnvFile(result.env)).toEqual(complete)
+  })
+
+  it.each(WORKFLOWS)('%s preserves the full multi-line certificate in GITHUB_ENV', (workflow) => {
+    const result = runDetect(workflow, { ...complete, APPLE_CERTIFICATE: multilineCertificate })
+    expect(result.status).toBe(0)
+    const exported = parseEnvFile(result.env)
+    // 多行值必须原样保留；单行 `NAME=value` 写法会丢掉第二行及之后的内容。
+    expect(exported.APPLE_CERTIFICATE).toBe(multilineCertificate)
+    expect(exported.APPLE_ID).toBe(complete.APPLE_ID)
   })
 
   it.each(WORKFLOWS)('%s rejects partially configured credentials', (workflow) => {

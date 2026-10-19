@@ -129,13 +129,16 @@ jobs:
           fi
 
           echo "signed=true" >> "$GITHUB_OUTPUT"
-          {
-            echo "APPLE_CERTIFICATE=$APPLE_CERTIFICATE"
-            echo "APPLE_CERTIFICATE_PASSWORD=$APPLE_CERTIFICATE_PASSWORD"
-            echo "APPLE_ID=$APPLE_ID"
-            echo "APPLE_PASSWORD=$APPLE_PASSWORD"
-            echo "APPLE_TEAM_ID=$APPLE_TEAM_ID"
-          } >> "$GITHUB_ENV"
+          # 证书是 base64，`base64` 输出带换行，必须用 heredoc 分隔符写法写进
+          # GITHUB_ENV；`NAME=value` 单行形式只保留第一行，后续行还会被当成非法格式。
+          delimiter="__dsh_apple_$(openssl rand -hex 8)__"
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            {
+              echo "${name}<<${delimiter}"
+              printf '%s\n' "${!name}"
+              echo "${delimiter}"
+            } >> "$GITHUB_ENV"
+          done
 
       - name: Build package
         if: steps.check.outputs.should_run == 'true'
