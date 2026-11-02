@@ -7,8 +7,8 @@ import ts from 'typescript'
 
 const REPO_ROOT = resolve(import.meta.dirname, '..')
 const PACKAGES_ROOT = join(REPO_ROOT, 'packages')
-const BUNDLE_PACKAGE = join(PACKAGES_ROOT, 'dsh-tauri-bundle', 'package.json')
-const RESOURCE_ROOT = join(REPO_ROOT, 'src-tauri', 'resources')
+const BUNDLE_PACKAGE = join(PACKAGES_ROOT, 'builtin-plugin-bundle', 'package.json')
+const RESOURCE_ROOT = join(REPO_ROOT, 'apps/desktop/src-tauri', 'resources')
 /** 运行期实际依赖的部署产物：`resources/node_modules/<name>`（Tauri 只捆绑 `resources/**`） */
 const DEPLOYED_NODE_MODULES = join(RESOURCE_ROOT, 'node_modules')
 
@@ -96,7 +96,7 @@ function verifyMaterialized(root: string): void {
  * （见 docs/specs/desktop.baisc.md「host 禁止静态引用 @deepseek-ai/*」）。整段排除即可，
  * 不必逐个删——它们只被 @deepseek-ai 自身互相引用。
  */
-const RUNTIME_PROVIDED_SCOPES = ['@deepseek-ai'] as const
+const RUNTIME_PROVIDED_SCOPES = ['@deepseek-ai', '@earendil-works'] as const
 
 /** 确认为死枝的嵌套子树：插件只走 `unstorage` 主入口，`server` 子路径与它依赖的 h3 v1 无人引用。 */
 const DEAD_SUBTREES = [join('unstorage', 'node_modules', 'h3')] as const
@@ -138,7 +138,7 @@ export function relativeSpecifiers(source: string): string[] {
   return moduleSpecifiers(source).filter(specifier => specifier.startsWith('.'))
 }
 
-function moduleSpecifiers(source: string): string[] {
+function moduleSpecifiers(source: string, optionalRequire?: string): string[] {
   const specifiers: string[] = []
   const file = ts.createSourceFile('runtime.js', source, ts.ScriptTarget.Latest, false, ts.ScriptKind.JS)
   ts.forEachChild(file, visit)
@@ -156,6 +156,9 @@ function moduleSpecifiers(source: string): string[] {
       target = node.arguments[0]
     }
     if (target && ts.isStringLiteralLike(target)) {
+      if (target.text === optionalRequire && ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
+        return
+      }
       specifiers.push(target.text)
     }
     ts.forEachChild(node, visit)
@@ -171,6 +174,7 @@ interface PackageManifest {
   exports?: unknown
   main?: string
   module?: string
+  dsh?: { taiwind?: string }
 }
 
 interface DeploymentIndex {
@@ -284,6 +288,9 @@ function entryTargets(manifest: PackageManifest): string[] {
     }
   }
   walk(manifest.exports)
+  if (manifest.dsh?.taiwind) {
+    targets.push(manifest.dsh.taiwind)
+  }
   return targets
 }
 
@@ -501,7 +508,10 @@ function verifyRelativeSpecifiers(root: string): number {
       if (!RUNTIME_FILE_PATTERN.test(file)) {
         continue
       }
-      for (const specifier of moduleSpecifiers(readFileSync(file, 'utf8'))) {
+      const optionalRequire = index.manifests.get(dir)?.name === '@tailwindcss/oxide' && file === join(dir, 'index.js')
+        ? './tailwindcss-oxide.wasi.cjs'
+        : undefined
+      for (const specifier of moduleSpecifiers(readFileSync(file, 'utf8'), optionalRequire)) {
         if (specifier === 'dsh-h3/genapi' || specifier.startsWith('dsh-h3/genapi/')) {
           throw new Error(`PLUGIN_DEPLOY_BUILD_TOOL_REQUIRED: ${relative(root, file)} -> ${specifier}`)
         }

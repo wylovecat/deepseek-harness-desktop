@@ -1,6 +1,6 @@
 <p align="center">
   <a href="https://github.com/dsh-tauri/deepseek-harness-desktop">
-    <img src="public/deepseek-harness-desktop-tauri.svg" width="96" alt="DeepSeek Harness Tauri Desktop" />
+    <img src="public/logo.svg" width="96" alt="DeepSeek Harness Tauri Desktop" />
   </a>
 </p>
 
@@ -21,7 +21,7 @@
   <a href="https://github.com/dsh-tauri/deepseek-harness-desktop/releases">
     <img src="https://img.shields.io/github/v/release/dsh-tauri/deepseek-harness-desktop?&label=Release&color=4D6BFE" alt="Release" />
   </a>
-  <img src="https://img.shields.io/badge/DSH-0.2.0--rc.2%2B-4d6bfe" alt="DSH 0.2.0-rc.2" />
+  <img src="https://img.shields.io/badge/DSH-0.2.1--rc.4-4d6bfe" alt="Recommended DSH 0.2.1-rc.4" />
   <img src="https://img.shields.io/github/license/dsh-tauri/deepseek-harness-desktop" alt="MIT License" />
   <br>
   <img src="https://img.shields.io/github/downloads/dsh-tauri/deepseek-harness-desktop/total?&label=downloads&color=4D6BFE" alt="Downloads" />
@@ -31,7 +31,7 @@
 </p>
 
 <p align="center">
-  <samp><a href="https://dshtauri.mintlify.site/en/installation">Download</a> · <strong>English</strong> · <a href="./README.es.md">Español</a> · <a href="https://dshtauri.mintlify.site">Docs</a> · <a href="./README.md">中文</a></samp>
+  <samp><a href="https://dshtauri.mintlify.site/en/installation">Download</a> · <strong>English</strong> · <a href="./README.es.md">Español</a> · <a href="./README.ru.md">Русский</a> · <a href="./README.ko.md">한국어</a> · <a href="https://dshtauri.mintlify.site">Docs</a> · <a href="./README.md">中文</a></samp>
 </p>
 
 <p align="center">
@@ -45,10 +45,10 @@
 
 ## Features
 
-- 🪶 **Native desktop** — Tauri 2 + React 19 + HeroUI 3, embedding the local Harness UI.
+- 🪶 **Native desktop** — Tauri 2(Electron Runtime) + React 19 + HeroUI 3, embedding the local Harness UI.
+- 📱 **Remote connection** — Scan a QR code in the Android / iOS app to connect to your computer's DSH over LAN or a Cloudflare public tunnel.
 - 🔄 **Runtime management** — Install dependencies, select core versions, and access desktop/core updates.
-- 🔀 **Multi-backend support** — Use DSH / Codex / Claude in one interface, powered by their native tools.
-- 🧩 **Plugin management** — 13 built-in plugins, plus local-directory installs, built-in disabling, community plugin installation, upgrades, removal, and error details.
+- 🧩 **Plugin management** — 12 built-in plugins, plus local-directory installs, built-in disabling, community plugin installation, upgrades, removal, and error details.
 - 🗂️ **Profile configuration** — Separate plugin/settings configurations, with one-click profile data migration, backup, and cloning.
 - 💽 **Data directory** — Pick where data lives during installation (Windows); migrate or roll it back later in Settings on Windows, macOS, and Linux.
 - ⌨️ **CLI integration** — Managed `dsh` / `pnpm` commands via shims, not a global npm core installation.
@@ -62,7 +62,6 @@ First-party plugins distributed with desktop resources:
 - [DSH Tauri](https://dshtauri.mintlify.site/en/built-in-plugins/dsh-tauri) — Core plugin: desktop-to-Harness communication, version adapters, and plugin dependency management
 - [DSH Tauri UI](https://dshtauri.mintlify.site/en/built-in-plugins/dsh-tauri-ui) — Desktop settings UI, native core components, themes, and palettes
 - [DSH Tauri Mobile UI](https://github.com/dsh-tauri/deepseek-harness-desktop/tree/main/packages/dsh-tauri-mobile-ui) — Touch layouts and mobile preferences
-- [DSH Tauri Kernel](https://github.com/dsh-tauri/deepseek-harness-desktop/tree/main/packages/dsh-tauri-kernel) — Local Codex / Claude integration and model selection
 - [DSH Tauri Worktree](https://dshtauri.mintlify.site/en/built-in-plugins/dsh-tauri-worktree) — Session-level Git worktrees and checkout
 - [DSH Tauri Extension](https://dshtauri.mintlify.site/en/built-in-plugins/dsh-tauri-extension) — Official plugin manager, plugin market, Skills, and MCP
 - [DSH Tauri Scheduler](https://dshtauri.mintlify.site/en/built-in-plugins/dsh-tauri-scheduler) — Scheduled tasks and run history
@@ -70,19 +69,20 @@ First-party plugins distributed with desktop resources:
 - [DSH Tauri Pet](https://dshtauri.mintlify.site/en/built-in-plugins/dsh-tauri-pet) — Desktop pet and activity state settings
 - [DSH Tauri Rightclick Menu](https://dshtauri.mintlify.site/en/built-in-plugins/dsh-tauri-rightclick) — Session, workspace, and text context menus
 - [DSH Tauri Model](https://dshtauri.mintlify.site/en/built-in-plugins/dsh-tauri-model) — Model selection, parameters, and automatic configuration
-- [DSH Tauri SSH](https://dshtauri.mintlify.site/en/built-in-plugins/dsh-tauri-ssh) — Remote Harness connections and sync over SSH
+- [DSH Tauri Remote](https://dshtauri.mintlify.site/en/built-in-plugins/dsh-tauri-remote) — Remote Harness connections and sync over SSH, plus sharing the local Harness over LAN or a public tunnel
 - [DSH Tauri Notification](https://dshtauri.mintlify.site/en/built-in-plugins/dsh-tauri-notification) — Conversation notifications and actions
 
 ## Optional presets
 
 Setup offers the following community plugins for installation on demand.
 
-- [DSH Market](https://github.com/dsh-market/dsh-market) — Community plugin market
 - [DSH Better Sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) — Per-session editor sidebar
 - [Billion Context](https://github.com/ranxianglei/billion-context) — Context compression and history restoration
+- [DSH Office Kit](https://github.com/hairyf/dsh-office-kit) — Office documents, PDF, presentations and spreadsheets
+- [DSH Market](https://github.com/dsh-market/dsh-market) — Community plugin market
 - [DSH Rewind](https://github.com/SiriLee/dsh-rewind) — Conversation rewind and workspace backups
-- [DSH Bridge](https://github.com/wenbin-wb/dsh-bridge) — Remote access, tunnels, and bot connections
 - [DSH IM](https://github.com/xmanrui/dsh-im) — IM channels and bot management
+- [DSH OPS](https://github.com/T-Auto/dsh-ops) — Low-level operations tools to reduce token usage and task execution time
 
 Request new or updated presets via [Issues](https://github.com/dsh-tauri/deepseek-harness-desktop/issues). Available versions follow the manifest's core compatibility rules.
 
@@ -92,14 +92,21 @@ Download the installer for your platform and architecture from [Releases](https:
 
 | Platform | Requirements | Installer |
 | --- | --- | --- |
-| Windows | Windows 10+, WebView2 | x64 `.exe` / `.msi` |
-| macOS | macOS 12+; web UI requires Safari 17.4+ capabilities | Intel / Apple Silicon `.dmg` |
-| Linux | WebKit2GTK 4.1 runtime libraries | x64 `.AppImage` / `.deb` |
+| Windows | Windows 10+ (bundled Chromium engine) | x64 `.exe` / `.msi` |
+| macOS | macOS 12+ (bundled Chromium engine) | Intel / Apple Silicon `.dmg` |
+| Linux | Bundled Chromium engine | x64 `.AppImage` / `.deb` |
 
 macOS also supports Homebrew installation:
 
 ```bash
 brew install dsh-tauri/desktop/deepseek-harness
+```
+
+On Fedora 43+ (x64 / ARM64) you can install from the Copr repository. Upgrades come through `dnf upgrade` and in-app updates are disabled. For prereleases install `dsh-tauri-beta` instead (it conflicts with `dsh-tauri`; switch with `sudo dnf swap dsh-tauri dsh-tauri-beta`):
+
+```bash
+sudo dnf copr enable fairyband/dsh-tauri
+sudo dnf install dsh-tauri        # stable
 ```
 
 - Standard installers need network on first launch to download missing runtime/core components. Git features require an available Git.
@@ -114,6 +121,17 @@ brew install dsh-tauri/desktop/deepseek-harness
 - Leave empty to inherit system/environment settings. Saved changes apply to new requests; retry failed downloads afterward.
 - SOCKS5H resolves destination names through the proxy; loopback connections stay direct.
 
+## Mobile support
+
+**DSH Mobile** accesses Harness on your computer over LAN or a public tunnel; it does not run a core on the phone.
+
+- **Android**: download an APK from [Releases](https://github.com/dsh-tauri/deepseek-harness-desktop/releases).
+- **iOS**: install the beta through the [TestFlight invitation](https://testflight.apple.com/join/kYXkpnp1), subject to approval and available slots. Unsigned IPAs in Releases require your own signing.
+
+Enable sharing from **Share** in the desktop's top bar, then scan the QR code to pair. Keep the computer, Harness, and any tunnel online. Access is not read-only; keep QR and access codes private. See the [mobile remote access guide](https://dshtauri.mintlify.site/en/guides/mobile-remote-access).
+
+The app is maintained only until an official mobile service launches. Development details are in the [mobile specification](docs/specs/native.md).
+
 ## Runtime
 
 Windows startup failures show a native dialog with the underlying error. For `STARTUP_LOW_INTEGRITY`:
@@ -124,8 +142,10 @@ Windows startup failures show a native dialog with the underlying error. For `ST
 
 | Current baseline | Version |
 | --- | --- |
-| Recommended Harness core | `0.2.0-rc.2` |
-| Declared minimum core | `0.1.5-rc.1`; not a compatibility guarantee for every plugin |
+| Recommended Harness core | `0.2.1-rc.4` |
+| Minimum supported core | `0.2.1-rc.4`; not a compatibility guarantee for every plugin |
+
+Older cores are no longer supported. Earlier compatibility records describe history, not the current support range.
 
 - Core and preset selection follow the [resource manifest](<./src-tauri/resources/manifest.jsonc>) and declared plugin version ranges, not a promise of compatibility with arbitrary latest upstream releases.
 - CLI integration is enabled by default in release: Windows / macOS / Linux update PATH automatically. Reopen your terminal; other shells may still need manual setup.
@@ -152,10 +172,18 @@ See the [English development guide](<./docs/DEVELOPMENT.md>) or [Chinese develop
 > [!NOTE]
 > **Security** — `dsh` can execute code locally. For learning / research / testing only; run it in a trusted, isolated environment.
 
+## Community Picks
+
+- [dsh-tauri-notify-webhook](https://github.com/iuuuuuuuu/dsh-tauri-notify-webhook) - Forward notifications to webhook, email (SMTP) or pushplus when a task stops abnormally or finishes by @iuuuuuuuu
+- [dsh-pdf-reader](https://github.com/SkanderBog/dsh-pdf-reader) - Page-by-page PDF reading, local OCR, citations, search and visual cropping by @SkanderBog
+- [dsh-context-manager](https://github.com/SkanderBog/dsh-context-manager) - Review context before applying, and choose per full-history group to keep, summarize or omit earlier content by @SkanderBog
+- [@ryuu-64/dsh-find-all](https://github.com/Ryuu-64/dsh-find-all) - Ctrl+F in the current conversation to find saved history by @Ryuu-64
+
 ## Related
 
 - [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) — upstream `dsh` agent platform
 - [deepseek-harness-pkg](https://github.com/dsh-tauri/deepseek-harness-pkg) — prebuilt Harness distributions and download source
+- [electron-rs](https://github.com/hairyf/electron-rs) · [tauri-runtime-electron](https://github.com/hairyf/tauri-runtime-electron) — Electron Rust and the Electron runtime for Tauri 2
 - [dsh-pet](https://github.com/PC2005-cloud/dsh-pet) · [dsh-pet-mov](https://github.com/dsh-tauri/dsh-pet-mov) · [dsh-pet-component](https://github.com/dsh-tauri/dsh-pet-component) — pet assets and renderer
 - [dsh-plugin-codex-pets](https://github.com/Skylarking/dsh-plugin-codex-pets) · [BongoCat](https://github.com/ayangweb/BongoCat) · [dsh-dafeiyu](https://github.com/QCYTSN/dsh-dafeiyu) · [codex-to-dsh-pet](https://github.com/Signalight/codex-to-dsh-pet) — pet reference projects
 

@@ -1,10 +1,10 @@
 <p align="center">
   <a href="https://github.com/dsh-tauri/deepseek-harness-desktop">
-    <img src="public/deepseek-harness-desktop-tauri.svg" width="96" alt="DeepSeek Harness Tauri Desktop" />
+    <img src="public/logo.svg" width="96" alt="DeepSeek Harness Tauri Desktop" />
   </a>
 </p>
 
-<h1 align="center">DeepSeek Harness Tauri 桌面版</h1>
+<h1 align="center">DSH Tauri 桌面版</h1>
 
 <p align="center">
   在桌面上运行 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> ——<br />
@@ -21,7 +21,7 @@
   <a href="https://github.com/dsh-tauri/deepseek-harness-desktop/releases">
     <img src="https://img.shields.io/github/v/release/dsh-tauri/deepseek-harness-desktop?&label=Release&color=4D6BFE" alt="Release" />
   </a>
-  <img src="https://img.shields.io/badge/DSH-0.2.0--rc.2%2B-4d6bfe" alt="DSH 0.2.0-rc.2" />
+  <img src="https://img.shields.io/badge/DSH-0.2.1--rc.4-4d6bfe" alt="Recommended DSH 0.2.1-rc.4" />
   <img src="https://img.shields.io/github/license/dsh-tauri/deepseek-harness-desktop" alt="MIT License" />
   <br>
   <img src="https://img.shields.io/github/downloads/dsh-tauri/deepseek-harness-desktop/total?&label=downloads&color=4D6BFE" alt="Downloads" />
@@ -31,7 +31,7 @@
 </p>
 
 <p align="center">
-  <samp><a href="https://dshtauri.mintlify.site/zh-CN/installation">Download</a> · <a href="./README.en.md">English</a> · <a href="./README.es.md">Español</a> · <a href="https://dshtauri.mintlify.site">文档</a> · <strong>中文</strong></samp>
+  <samp><a href="https://dshtauri.mintlify.site/zh-CN/installation">Download</a> · <a href="./README.en.md">English</a> · <a href="./README.es.md">Español</a> · <a href="./README.ru.md">Русский</a> · <a href="./README.ko.md">한국어</a> · <a href="https://dshtauri.mintlify.site">文档</a> · <strong>中文</strong></samp>
 </p>
 
 <p align="center">
@@ -44,10 +44,10 @@
 
 ## 功能
 
-- 🪶 **原生桌面** — Tauri 2 + React 19 + Hero 3，内嵌本地 Harness 界面。
+- 🪶 **原生桌面** — Tauri 2(Electron Runtime) + React 19 + Hero 3，内嵌本地 Harness 界面。
+- 📱 **远程连接** — Android / iOS 移动端扫码连接电脑上的 DSH，支持局域网与 Cloudflare 公网隧道。
 - 🔄 **运行时管理** — 安装依赖、选择内核版本，并提供桌面端与内核更新入口。
-- 🔀 **多内核支持** — 在同一界面畅用 DSH / Codex / Claude，发挥各自原生工具能力。
-- 🧩 **插件管理** — 13 个内置插件；支持本地路径安装、内置插件停用、社区插件安装、升级、卸载与错误查看。
+- 🧩 **插件管理** — 12 个内置插件；支持本地路径安装、内置插件停用、社区插件安装、升级、卸载与错误查看。
 - 🗂️ **档案配置** — 分别管理插件与设置，支持一键迁移档案数据、备份、克隆；
 - 💽 **数据目录** — 安装时（Windows）可选择数据存放位置；能在设置里整体迁移与回滚。
 - ⌨️ **命令行集成** — 通过托管 shim 提供 `dsh` / `pnpm` 命令行工具，不是全局 npm 内核安装。
@@ -61,7 +61,6 @@
 - [DSH Tauri](https://dshtauri.mintlify.site/zh-CN/built-in-plugins/dsh-tauri) — 核心插件，桌面端与 Harness 通信、版本适配器、插件依赖管理
 - [DSH Tauri UI](https://dshtauri.mintlify.site/zh-CN/built-in-plugins/dsh-tauri-ui) — 桌面设置界面、原生核心组件、主题与配色
 - [DSH Tauri Mobile UI](https://dshtauri.mintlify.site/zh-CN/built-in-plugins/dsh-tauri-mobile-ui) — 触屏布局与移动端偏好设置
-- [DSH Tauri Kernel](https://github.com/dsh-tauri/deepseek-harness-desktop/tree/main/packages/dsh-tauri-kernel) — 本机 Codex / Claude 接入与模型选择
 - [DSH Tauri Worktree](https://dshtauri.mintlify.site/zh-CN/built-in-plugins/dsh-tauri-worktree) — 会话级 Git 工作树与检出
 - [DSH Tauri Extension](https://dshtauri.mintlify.site/zh-CN/built-in-plugins/dsh-tauri-extension) — 官方插件管理、插件市场、Skills 与 MCP
 - [DSH Tauri Scheduler](https://dshtauri.mintlify.site/zh-CN/built-in-plugins/dsh-tauri-scheduler) — 定时任务与执行记录
@@ -69,19 +68,20 @@
 - [DSH Tauri Pet](https://dshtauri.mintlify.site/zh-CN/built-in-plugins/dsh-tauri-pet) — 桌宠与活动状态设置
 - [DSH Tauri Rightclick Menu](https://dshtauri.mintlify.site/zh-CN/built-in-plugins/dsh-tauri-rightclick) — 会话、工作区与正文右键菜单
 - [DSH Tauri Model](https://dshtauri.mintlify.site/zh-CN/built-in-plugins/dsh-tauri-model) — 模型选择与参数、自动配置模型
-- [DSH Tauri SSH](https://dshtauri.mintlify.site/zh-CN/built-in-plugins/dsh-tauri-ssh) — SSH 远端 Harness 连接与同步
+- [DSH Tauri Remote](https://dshtauri.mintlify.site/zh-CN/built-in-plugins/dsh-tauri-remote) — SSH 远端 Harness 连接与同步，并把本机 Harness 分享到局域网或公网隧道
 - [DSH Tauri Notification](https://dshtauri.mintlify.site/zh-CN/built-in-plugins/dsh-tauri-notification) — 原生级会话通知与交互操作
 
 ## 可选预设
 
 启动引导提供以下社区插件，可按需安装；
 
-- [DSH Market](https://github.com/dsh-market/dsh-market) — 社区插件市场
 - [DSH Better Sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) — 按会话隔离的右编辑器侧栏
 - [Billion Context](https://github.com/ranxianglei/billion-context) — 上下文压缩与历史恢复
+- [DSH Office Kit](https://github.com/hairyf/dsh-office-kit) — Office 文档、PDF、演示文稿与表格
+- [DSH Market](https://github.com/dsh-market/dsh-market) — 社区插件市场
 - [DSH Rewind](https://github.com/SiriLee/dsh-rewind) — 对话回退与工作区备份
-- [DSH Bridge](https://github.com/wenbin-wb/dsh-bridge) — 远程访问、隧道接入
 - [DSH IM](https://github.com/xmanrui/dsh-im) — IM 渠道与机器人管理
+- [DSH OPS](https://github.com/T-Auto/dsh-ops) — 底层操作工具，减少 Token 消耗与任务耗时
 
 新增或更新预设请提交 [Issue](https://github.com/dsh-tauri/deepseek-harness-desktop/issues)；可用版本由清单中的内核兼容规则决定。
 
@@ -91,14 +91,21 @@
 
 | 平台 | 要求 | 安装包 |
 | --- | --- | --- |
-| Windows | Windows 10+、WebView2 | x64 `.exe` / `.msi` |
-| macOS | macOS 12+；Web 界面需 Safari 17.4+ 能力 | Intel / Apple Silicon `.dmg` |
-| Linux | WebKit2GTK 4.1 运行库 | x64 `.AppImage` / `.deb` |
+| Windows | Windows 10+（内置 Chromium 内核） | x64 `.exe` / `.msi` |
+| macOS | macOS 12+（内置 Chromium 内核） | Intel / Apple Silicon `.dmg` |
+| Linux | 内置 Chromium 内核 | x64 `.AppImage` / `.deb` |
 
 macOS 也可通过 Homebrew 安装：
 
 ```bash
 brew install dsh-tauri/desktop/deepseek-harness
+```
+
+Fedora 43+（x64 / ARM64）可通过 Copr 仓库安装，升级随 `dnf upgrade` 进行，应用内更新已关闭；想跟进预发布版可改装 `dsh-tauri-beta`（与 `dsh-tauri` 互斥，用 `sudo dnf swap dsh-tauri dsh-tauri-beta` 切换）：
+
+```bash
+sudo dnf copr enable fairyband/dsh-tauri
+sudo dnf install dsh-tauri        # 正式版
 ```
 
 - 普通安装包首次启动需联网下载缺失的运行时与内核；Git 功能需要可用的 Git。
@@ -113,6 +120,17 @@ brew install dsh-tauri/desktop/deepseek-harness
 - 留空沿用系统/环境代理；保存后对新请求生效，可重试失败的下载。
 - SOCKS5H 通过代理解析目标域名；本机回环连接始终直连。
 
+## 移动端支持
+
+**DSH Mobile** 通过局域网或公网隧道访问电脑上的 Harness，不在手机运行内核。
+
+- **Android**：从 [Releases](https://github.com/dsh-tauri/deepseek-harness-desktop/releases) 下载 APK。
+- **iOS**：通过 [TestFlight 邀请](https://testflight.apple.com/join/kYXkpnp1)安装测试版，以审核与名额为准；Release 中的未签名 IPA 需自行签名。
+
+在桌面顶部**远程**开启分享，手机扫码配对；电脑、Harness 与所用隧道须在线。远程访问并非只读，请勿公开二维码或访问码，详见[手机远程访问指南](https://dshtauri.mintlify.site/zh-CN/guides/mobile-remote-access)。
+
+移动端仅在官方移动服务推出前维护；开发说明见[移动端规范](docs/specs/native.md)。
+
 ## 运行方式
 
 Windows 启动失败时会通过原生对话框显示具体错误。若出现 `STARTUP_LOW_INTEGRITY`：
@@ -123,8 +141,10 @@ Windows 启动失败时会通过原生对话框显示具体错误。若出现 `S
 
 | 当前基线 | 版本 |
 | --- | --- |
-| 推荐 Harness 内核 | `0.2.0-rc.2` |
-| 声明的内核最低版本 | `0.1.5-rc.1`，不保证所有兼容 |
+| 推荐 Harness 内核 | `0.2.1-rc.4` |
+| 支持的内核最低版本 | `0.2.1-rc.4`，不保证所有插件兼容 |
+
+更早内核不再支持；旧兼容记录仅保留历史事实，不代表当前支持范围。
 
 - 内核与预设选择遵循[资源清单](<./src-tauri/resources/manifest.jsonc>)及插件声明的版本范围；不保证任意最新上游版本都兼容。
 - 正式版默认启用 CLI 集成：Windows / macOS / Linux 自动更新 PATH。需重新打开终端，其他 shell 仍需要手动配置。
@@ -151,12 +171,20 @@ Windows 启动失败时会通过原生对话框显示具体错误。若出现 `S
 > [!NOTE]
 > **安全声明** — `dsh` 具备本地代码执行能力。仅供学习 / 研究 / 测试，请在可信、隔离的环境中使用。
 
+## 社区推荐
+
+- [dsh-tauri-notify-webhook](https://github.com/iuuuuuuuu/dsh-tauri-notify-webhook) — 任务异常停止或完成时把通知转发到 webhook、邮件（SMTP）或 pushplus by @iuuuuuuuu
+- [dsh-pdf-reader](https://github.com/SkanderBog/dsh-pdf-reader) — 按页 PDF 阅读、本地 OCR、引用、搜索和视觉裁剪 by @SkanderBog
+- [dsh-context-manager](https://github.com/SkanderBog/dsh-context-manager) — 应用前审阅上下文，并按完整历史组选择保留、总结或省略较早内容 by @SkanderBog
+- [@ryuu-64/dsh-find-all](https://github.com/Ryuu-64/dsh-find-all) — 在当前对话中按 Ctrl+F，查找已保存的历史内容 by @Ryuu-64
+
 ## 相关项目
 
 - [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) — 上游 `dsh` agent 平台
 - [deepseek-harness-pkg](https://github.com/dsh-tauri/deepseek-harness-pkg) — 预打包 Harness 发行版与下载源
+- [electron-rs](https://github.com/hairyf/electron-rs) · [tauri-runtime-electron](https://github.com/hairyf/tauri-runtime-electron) — Electron Rust 与 Tauri 2 的 Electron 运行时
 - [dsh-pet](https://github.com/PC2005-cloud/dsh-pet) · [dsh-pet-mov](https://github.com/dsh-tauri/dsh-pet-mov) · [dsh-pet-component](https://github.com/dsh-tauri/dsh-pet-component) — 桌宠素材与渲染组件
-- [dsh-plugin-codex-pets](https://github.com/Skylarking/dsh-plugin-codex-pets) · [BongoCat](https://github.com/ayangweb/BongoCat) · [dsh-dafeiyu](https://github.com/QCYTSN/dsh-dafeiyu) · [codex-to-dsh-pet](https://github.com/Signalight/codex-to-dsh-pet) — 桌宠参考项目
+- [dsh-plugin-codex-pets](https://github.com/Skylarking/dsh-plugin-codex-pets) · [BongoCat](https://github.com/ayangweb/BongoCat) · [dsh-dafeiyu](https://github.com/QCYTSN/dsh-dafeiyu) · [codex-to-dsh-pet](https://github.com/Signalight/codex-to-dsh-pet) · [dsh-pet-sticker](https://github.com/PC2005-cloud/dsh-pet-sticker) — 桌宠参考项目
 
 ## Contributors
 
