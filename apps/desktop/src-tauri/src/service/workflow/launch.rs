@@ -756,6 +756,12 @@ pub async fn launch(app_handle: crate::AppHandle) -> Result<(), String> {
     if let Err(e) = crate::service::patch::workspace_view::apply(&app_handle) {
         log::warn!("workspace view state patch failed: {e}");
     }
+    // 上游 todo 投影只在 turn/start 清空、turn/end 不收敛，长回合里模型又倾向于把清单
+    // 一次性写完，于是「任务」面板长期停在「第一项进行中」。补丁让 turn/end 把残留的
+    // in_progress 降级为 pending，并把「完成即刻标记、逐项推进」补回工具描述。
+    if let Err(e) = crate::service::patch::todo_progress::apply(&app_handle) {
+        log::warn!("todo progress patch failed: {e}");
+    }
     // 内置插件（dsh-tauri-*）只在壳的插件弹窗里可见：官方侧边栏 Plugins 页与插件市场
     // 都按各自的硬编码内置/inbox 名单判断 bundle 归属，上游没有可配置开关，因此对这两个
     // 前端做幂等补丁。最佳努力且幂等：锚点缺失（上游改写布局）时安全跳过。

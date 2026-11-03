@@ -267,6 +267,7 @@ pub(super) fn prepare(
             "workspace view state patch",
             patch::workspace_view::apply_at,
         ),
+        ("todo progress patch", patch::todo_progress::apply_at),
         (
             "plugin visibility patch",
             patch::plugin_visibility::apply_at,
