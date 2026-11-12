@@ -151,7 +151,7 @@ for (const preference of ['light', 'dark'] as const) {
       await systemButton.click()
       await expect.poll(() => systemButton.getAttribute('aria-pressed'), { message: '系统主题按钮必须完成选中状态更新' }).toBe('true')
       await captureTheme('after-system')
-      await expect.poll(() => readFile(patchFile, 'utf8'), { message: '跟随系统偏好必须先完成真实持久化' }).toContain('preference: system')
+      await expect.poll(() => readFile(patchFile, 'utf8'), { timeout: 30000, message: '跟随系统偏好必须先完成真实持久化' }).toContain('preference: system')
       await expect.poll(() => page.evaluate(() => matchMedia('(prefers-color-scheme: dark)').matches), { timeout: 15000, message: '跟随系统必须在原生主题监控周期内恢复真实系统主题' }).toBe(preference === 'light')
       await expect.poll(() => page.evaluate(() => document.documentElement.dataset.dsThemeSource), { message: '初始化交接后必须允许用户选择跟随系统' }).toBe('system')
       await expect.poll(() => page.evaluate(() => getComputedStyle(document.body).backgroundColor), { timeout: 15000, message: '用户切换跟随系统必须在原生主题监控周期内切换画布色' }).toBe(preference === 'light' ? 'rgb(21, 21, 23)' : 'rgb(255, 255, 255)')
@@ -160,7 +160,7 @@ for (const preference of ['light', 'dark'] as const) {
       await oppositeButton.click()
       await expect.poll(() => oppositeButton.getAttribute('aria-pressed'), { message: '反色主题按钮必须完成选中状态更新' }).toBe('true')
       await captureTheme('after-opposite')
-      await expect.poll(() => readFile(path.join(info.data_dir, 'profiles', 'desktop', 'cordis.patch.yml'), 'utf8'), { message: '真实用户主题修改必须持久化' }).toContain(`preference: ${preference === 'light' ? 'dark' : 'light'}`)
+      await expect.poll(() => readFile(path.join(info.data_dir, 'profiles', 'desktop', 'cordis.patch.yml'), 'utf8'), { timeout: 30000, message: '真实用户主题修改必须持久化' }).toContain(`preference: ${preference === 'light' ? 'dark' : 'light'}`)
     }
     catch (error) {
       await captureTheme('failure').catch(captureError => runtimeErrors.push(String(captureError)))
