@@ -18,8 +18,16 @@ pub fn get_profiles(window: crate::Window, app_handle: AppHandle) -> Vec<profile
 
 /// 新建档案（初始化 $DSH_HOME/profiles/<id>，web 模板）
 #[tauri::command]
-pub fn create_profile(app_handle: AppHandle, name: String) -> Result<profile::Profile, String> {
-    profile::create(&app_handle, &name)
+pub async fn create_profile(
+    app_handle: AppHandle,
+    name: String,
+) -> Result<profile::Profile, String> {
+    let profile_id = profile::active_profile(&app_handle);
+    let mutation = profile::mutation::acquire().await?;
+    mutation
+        .spawn_blocking(profile_id, move || profile::create(&app_handle, &name))
+        .await
+        .map_err(|e| format!("PROFILE_CREATE_TASK: {e}"))?
 }
 
 /// 切换当前窗口的档案。只有主窗口的切换会持久化成下次启动档案；额外窗口的
@@ -37,9 +45,11 @@ pub async fn set_active_profile(
     } else {
         profile::select(&app_handle, &id)?
     };
-    crate::service::workflow::instances::set_safe_mode(false);
     selected.active = true;
     crate::service::workflow::instances::bind_window(window.label(), &id);
+    if old != id {
+        crate::desktop::window::forget_harness_restart(&app_handle, window.label());
+    }
     if old != id && !crate::service::workflow::instances::is_attached(&old) {
         crate::service::workflow::instances::scope(old, crate::service::workflow::stop(app_handle))
             .await?;
@@ -58,7 +68,7 @@ pub async fn remove_profile(
     if id == profile::DEFAULT_PROFILE {
         return Err("PROFILE_DEFAULT_NOT_REMOVABLE: the default profile cannot be removed".into());
     }
-    let _transition = crate::service::workflow::acquire_core_transition().await?;
+    let mutation = profile::mutation::acquire().await?;
     let current = crate::service::workflow::instances::window_profile(&app_handle, window.label());
     if id == current || crate::service::workflow::instances::is_attached(&id) {
         return Err("PROFILE_ACTIVE_NOT_REMOVABLE: the active profile cannot be removed".into());
@@ -67,7 +77,10 @@ pub async fn remove_profile(
         crate::service::workflow::stop(app_handle.clone()).await
     })
     .await?;
-    crate::service::workflow::instances::scope_sync(current, || profile::remove(&app_handle, &id))
+    mutation
+        .spawn_blocking(current, move || profile::remove(&app_handle, &id))
+        .await
+        .map_err(|e| format!("PROFILE_REMOVE_TASK: {e}"))?
 }
 
 /// 重置档案（清空档案目录并按模板重新初始化；会话数据在档案目录之外，保留）
@@ -78,13 +91,16 @@ pub async fn reset_profile(
     id: String,
 ) -> Result<(), String> {
     crate::service::fs_guard::validate_id(&id)?;
-    let _transition = crate::service::workflow::acquire_core_transition().await?;
+    let mutation = profile::mutation::acquire().await?;
     if crate::service::workflow::instances::attached_elsewhere(&id, window.label()) {
         return Err("PROFILE_IN_USE: stop and detach profile before reset".into());
     }
-    crate::service::workflow::instances::scope(id.clone(), async {
+    crate::service::workflow::instances::scope(id.clone(), async move {
         crate::service::workflow::stop(app_handle.clone()).await?;
-        profile::reset(&app_handle, &id)
+        mutation
+            .spawn_blocking(id.clone(), move || profile::reset(&app_handle, &id))
+            .await
+            .map_err(|e| format!("PROFILE_RESET_TASK: {e}"))?
     })
     .await
 }
@@ -100,12 +116,14 @@ pub async fn clone_profile(
     source_id: String,
     name: Option<String>,
 ) -> Result<profile::Profile, String> {
+    let mutation = profile::mutation::acquire().await?;
     let profiles_root = config::get_dsh_data_path(&app_handle).join("profiles");
-    tauri::async_runtime::spawn_blocking(move || {
-        profile::clone_with_root(&profiles_root, &source_id, name.as_deref())
-    })
-    .await
-    .map_err(|e| format!("PROFILE_CLONE_TASK: {e}"))?
+    mutation
+        .spawn_blocking(source_id.clone(), move || {
+            profile::clone_with_root(&profiles_root, &source_id, name.as_deref())
+        })
+        .await
+        .map_err(|e| format!("PROFILE_CLONE_TASK: {e}"))?
 }
 
 /// 分析源档案的可迁移插件与档案级数据（只读，判定基准 = 当前核心版本）
@@ -133,10 +151,9 @@ pub async fn migrate_profile_data(
     let handle = app_handle.clone();
     let profile_id =
         crate::service::workflow::instances::window_profile(&app_handle, window.label());
-    tauri::async_runtime::spawn_blocking(move || {
-        crate::service::workflow::instances::scope_sync(profile_id, || {
-            profile::migrate::apply(&handle, &source_id, &items)
-        })
+    let mutation = profile::mutation::acquire().await?;
+    mutation.spawn_blocking(profile_id, move || {
+        profile::migrate::apply(&handle, &source_id, &items)
     })
     .await
     .map_err(|e| format!("PROFILE_MIGRATION_TASK: {e}"))?
@@ -144,28 +161,6 @@ pub async fn migrate_profile_data(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn profile_removal_waits_for_stop_before_deleting_detached_data() {
-        let source = include_str!("profile.rs");
-        let removal = source
-            .split("pub async fn remove_profile(")
-            .nth(1)
-            .unwrap()
-            .split("pub async fn reset_profile(")
-            .next()
-            .unwrap();
-        let lock = removal.find("acquire_core_transition().await?").unwrap();
-        let attached = removal.find("instances::is_attached(&id)").unwrap();
-        let scope = removal.find("instances::scope(id.clone(),").unwrap();
-        let stop = removal
-            .find("workflow::stop(app_handle.clone()).await")
-            .unwrap();
-        let confirmed = stop + removal[stop..].find(".await?;").unwrap();
-        let delete = removal.find("profile::remove(&app_handle, &id)").unwrap();
-        assert!(lock < attached && attached < scope && scope < stop);
-        assert!(stop < confirmed && confirmed < delete);
-    }
-
     #[test]
     fn profile_switch_persists_the_startup_profile_only_from_the_main_window() {
         let source = include_str!("profile.rs");
@@ -190,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn safe_mode_is_transient_and_never_written_to_the_startup_profile() {
+    fn stale_setting_writes_never_replace_the_startup_profile() {
         use crate::{config, service::profile, service::workflow::instances};
         use tauri::utils::config::AppDirectoriesOverride;
 
@@ -200,7 +195,7 @@ mod tests {
             command
                 .args([
                     "--exact",
-                    "bridge::profile::tests::safe_mode_is_transient_and_never_written_to_the_startup_profile",
+                    "bridge::profile::tests::stale_setting_writes_never_replace_the_startup_profile",
                     "--nocapture",
                 ])
                 .env("DSH_TEST_PROFILE_PERSISTENCE", scratch.path())
@@ -236,19 +231,16 @@ mod tests {
             .build(context)
             .unwrap();
         let app = app.handle();
-        for id in ["custom", profile::SAFE_PROFILE] {
+        for id in ["custom", "second"] {
             std::fs::create_dir_all(profile::profile_dir_of(app, id)).unwrap();
         }
         assert!(profile::set_active(app, "custom").unwrap().active);
         assert_eq!(config::get_store_dat_setting(app).active_profile, "custom");
-        instances::set_safe_mode(true);
-        assert_eq!(profile::active_profile(app), "safe");
-        assert_eq!(config::get_store_dat_setting(app).active_profile, "custom");
-        instances::scope_sync("custom".into(), || {
-            assert_eq!(profile::active_profile(app), "custom");
+        instances::scope_sync("second".into(), || {
+            assert_eq!(profile::active_profile(app), "second");
         });
         let mut stale = config::get_store_dat_setting(app);
-        stale.active_profile = "safe".into();
+        stale.active_profile = "second".into();
         config::set_store_dat_setting(app, stale);
         assert_eq!(config::get_store_dat_setting(app).active_profile, "custom");
         assert!(
@@ -256,12 +248,8 @@ mod tests {
                 .unwrap_err()
                 .starts_with("PROFILE_NOT_FOUND:")
         );
-        assert_eq!(profile::active_profile(app), "safe");
-        instances::set_safe_mode(false);
         assert_eq!(profile::active_profile(app), "custom");
-        instances::set_safe_mode(true);
         assert!(profile::set_active(app, "desktop").unwrap().active);
-        assert!(!instances::safe_mode());
         assert_eq!(config::get_store_dat_setting(app).active_profile, "desktop");
     }
 
@@ -277,11 +265,6 @@ mod tests {
                 include_str!("remote.rs"),
                 "pub async fn remote_open_window(",
                 "#[cfg(test)]",
-            ),
-            (
-                include_str!("lifecycle.rs"),
-                "pub async fn enter_safe_mode(",
-                "pub async fn quarantine_broken_patch_layers(",
             ),
             (
                 include_str!("profile.rs"),

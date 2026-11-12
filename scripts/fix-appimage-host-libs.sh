@@ -45,6 +45,47 @@ readonly EXCLUDED_MEDIA=(
   'libsoup-2.4.so*'
   'libgupnp*.so*'
 )
+# #1407：镜像只打包了半个 NSS（无 libsoftokn3/libfreebl3），宿主 softoken 在镜像内旧
+# libnssutil3 之下缺 NSSUTIL_3.108 版本符号，加载失败后 Chromium 在 crypto/nss_util.cc
+# 触发 int3（SIGTRAP，实测 Fedora 45 / Arch）。deb 不打包 NSS 且正常，故交还宿主。
+# 注意勿写成 libnss*.so*：那会命中 glibc 的 libnss_files.so.2 等 name service 模块。
+readonly EXCLUDED_NSS=(
+  'libnss3.so*'
+  'libnssutil3.so*'
+  'libsmime3.so*'
+  'libnspr4.so*'
+  'libplc4.so*'
+  'libplds4.so*'
+)
+# 镜像内 OpenSSL 3.0 / krb5 早于宿主 libcurl、git 所需的 OPENSSL_3.5.0 与
+# krb5support_0_MIT k5_buf_cstring：LD_LIBRARY_PATH 置顶后宿主 git-remote-https
+# 直接 `fatal: remote helper 'https' aborted session`，git 托管插件安装全灭。
+readonly EXCLUDED_CRYPTO=(
+  'libssl.so.3*'
+  'libcrypto.so.3*'
+  'libkrb5.so.3*'
+  'libk5crypto.so.3*'
+  'libkrb5support.so.0*'
+  'libgssapi_krb5.so.2*'
+  'libkeyutils.so.1*'
+)
+# #1407 残留：libcups.so.2 是镜像内唯一 DT_NEEDED libgssapi_krb5.so.2（gssapi_krb5_2_MIT）
+# 的 ELF，krb5 链交还宿主后它就变成悬空依赖；libprintbackend-cups.so 是 libcups 的唯一消费者。
+# libgcrypt.so.20 无人 NEEDED，且它自己 NEEDED 的 libgpg-error.so.0 从来没被打包进来。
+# 三者都不该留在镜像里：Electron 主程序本身就硬 NEEDED libcups.so.2，宿主必须提供，与 deb 一致。
+readonly EXCLUDED_LINKAGE=(
+  'libcups.so.2*'
+  'libprintbackend-cups.so*'
+  'libgcrypt.so*'
+)
+readonly EXCLUDED_ALL=(
+  "${EXCLUDED_LIBS[@]}"
+  "${EXCLUDED_GLIB[@]}"
+  "${EXCLUDED_MEDIA[@]}"
+  "${EXCLUDED_NSS[@]}"
+  "${EXCLUDED_CRYPTO[@]}"
+  "${EXCLUDED_LINKAGE[@]}"
+)
 
 # 在镜像中扫描 squashfs 4.0 superblock：magic "hsqs"，版本字段 s_major/s_minor == 4/0，
 # block_size 为 2 的幂且在 [4096, 1048576]，compression 在 1..6，block_log 与 block_size 自洽。
@@ -162,7 +203,7 @@ fi
 
 removed=()
 # #1209：整套媒体栈交给宿主，避免版本混用。#1165：libsoup-2.4 混进 WebKitGTK 的 libsoup-3 进程会 SIGTRAP，打包物里不得残留。
-for lib in "${EXCLUDED_LIBS[@]}" "${EXCLUDED_GLIB[@]}" "${EXCLUDED_MEDIA[@]}"; do
+for lib in "${EXCLUDED_ALL[@]}"; do
   while IFS= read -r -d '' found; do
     rm -rf "$found"
     removed+=("${found#"$tree"/}")
@@ -238,7 +279,7 @@ else
   fi
 fi
 
-for lib in "${EXCLUDED_LIBS[@]}" "${EXCLUDED_GLIB[@]}" "${EXCLUDED_MEDIA[@]}"; do
+for lib in "${EXCLUDED_ALL[@]}"; do
   if find "$verified" -name "$lib" -print -quit | grep -q .; then
     echo "fix-appimage-host-libs: verification failed, $lib is still bundled" >&2
     verdict=1
@@ -248,6 +289,8 @@ if find "$verified" -type f \( -name 'libgstsoup.so' -o -name 'libgstwebrtc.so' 
   echo "fix-appimage-host-libs: verification failed, libsoup-2.4 GStreamer plugins are still bundled (#1165)" >&2
   verdict=1
 fi
+# #1407：krb5 链被剔除后，libcups 这类 NEEDED 它会变成悬空依赖；NEEDED 闭合性的全量检查
+# 由 scripts/appimage_lib_closure.py 在 CI 的 check-linux-glibc-abi.sh 里做，此处只守 libsoup。
 if command -v readelf >/dev/null 2>&1; then
   while IFS= read -r -d '' elf; do
     if readelf -d "$elf" 2>/dev/null | grep -q 'NEEDED.*libsoup-2[.]4'; then

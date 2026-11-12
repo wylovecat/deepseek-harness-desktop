@@ -2,8 +2,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { apply } from 'dsh-taiwind'
-import { afterEach, expect, it } from 'vitest'
-import { pruneDeployment } from './build-plugins.ts'
+import { afterEach, expect, it, vi } from 'vitest'
+import { pruneDeployment, pruneForeignLibcBindings, verifyRemoteNativeBindings } from './build-plugins.ts'
 
 const roots = []
 const optionalWasi = `let nativeBinding = {}
@@ -29,6 +29,7 @@ function fixture(name = '@tailwindcss/oxide', source = optionalWasi, file = 'ind
 }
 
 afterEach(() => {
+  vi.unstubAllEnvs()
   for (const root of roots.splice(0))
     rmSync(root, { recursive: true, force: true })
 })
@@ -56,13 +57,14 @@ it('compiles declared Tailwind CSS from pruned release resources', async () => {
   writeFileSync(join(dir, 'src/development.ts'), 'export const unused = true')
   writeFileSync(join(dir, 'dist/client.cjs'), 'module.exports = "flex bg-release-accent"')
   pruneDeployment(root, names)
+  vi.stubEnv('DSH_HOME', join(root, 'home'))
   const cleanups = []
   const warnings = []
   let route
   try {
     await apply({
       clientModules: {
-        graph: () => ({ entries: [{ id: 'styled-plugin' }] }),
+        graph: () => ({ entries: [{ id: 'styled-plugin', rev: 'release' }] }),
         clientPath: () => join(dir, 'dist/client.cjs'),
         onGraphChanged: () => () => {},
         onRebuilt: () => () => {},
@@ -80,10 +82,13 @@ it('compiles declared Tailwind CSS from pruned release resources', async () => {
     })
     let status
     let css
-    route.handler({ method: 'GET', headers: {} }, {
+    await route.handler({ method: 'GET', headers: {} }, {
       setHeader() {},
       writeHead: (value) => { status = value },
       end: (value) => { css = value },
+    })
+    await vi.waitFor(() => {
+      expect(existsSync(join(root, 'home/taiwind/styles.css'))).toBe(true)
     })
     expect(warnings).toEqual([])
     expect(status).toBe(200)
@@ -151,4 +156,63 @@ it.each([
   const { root, names } = fixture('@tailwindcss/oxide', source)
   expect(() => pruneDeployment(root, names)).toThrow(`PLUGIN_DEPLOY_RELATIVE_MISSING:
   ${join('@tailwindcss/oxide', 'index.js')} -> ./tailwindcss-oxide.wasi.cjs`)
+})
+
+// 远端矩阵只有 glibc 绑定；musl 绑定不在其中，且会让 Linux 上的 linuxdeploy 崩溃。
+const REMOTE_MATRIX = ['linux-x64-gnu', 'linux-arm64-gnu', 'darwin-x64']
+const MUSL = ['linux-x64-musl', 'linux-arm64-musl']
+
+it('accepts a deploy tree that carries every binding the remote matrix needs', () => {
+  const root = mkdtempSync(join(tmpdir(), 'plugin-deploy-native-'))
+  roots.push(root)
+  for (const name of REMOTE_MATRIX) {
+    const dir = join(root, '@tailwindcss', `oxide-${name}`)
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, `tailwindcss-oxide.${name}.node`), '')
+  }
+  expect(() => verifyRemoteNativeBindings(root)).not.toThrow()
+})
+
+it('removes musl bindings so linuxdeploy cannot choke on them during AppImage bundling', () => {
+  const root = mkdtempSync(join(tmpdir(), 'plugin-deploy-native-'))
+  roots.push(root)
+  for (const name of ['linux-x64-gnu', 'linux-arm64-gnu', 'linux-x64-musl', 'linux-arm64-musl']) {
+    const dir = join(root, '@tailwindcss', `oxide-${name}`)
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, `tailwindcss-oxide.${name}.node`), '')
+  }
+  pruneForeignLibcBindings(root)
+  expect(existsSync(join(root, '@tailwindcss', 'oxide-linux-x64-musl'))).toBe(false)
+  expect(existsSync(join(root, '@tailwindcss', 'oxide-linux-arm64-musl'))).toBe(false)
+  expect(existsSync(join(root, '@tailwindcss', 'oxide-linux-x64-gnu'))).toBe(true)
+  expect(existsSync(join(root, '@tailwindcss', 'oxide-linux-arm64-gnu'))).toBe(true)
+})
+
+it('tolerates musl bindings in the tree, they are not part of the remote matrix', () => {
+  const root = mkdtempSync(join(tmpdir(), 'plugin-deploy-native-'))
+  roots.push(root)
+  for (const name of [...REMOTE_MATRIX, ...MUSL]) {
+    const dir = join(root, '@tailwindcss', `oxide-${name}`)
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, `tailwindcss-oxide.${name}.node`), '')
+  }
+  expect(() => verifyRemoteNativeBindings(root)).not.toThrow()
+})
+
+it.each([
+  ['a missing platform package', 'linux-x64-gnu', false],
+  ['a platform package shipped without its native addon', 'linux-arm64-gnu', true],
+])('rejects %s so a Windows build cannot ship bindings the remote cannot load', (_, omit, withAddon) => {
+  const root = mkdtempSync(join(tmpdir(), 'plugin-deploy-native-'))
+  roots.push(root)
+  for (const name of REMOTE_MATRIX) {
+    const dir = join(root, '@tailwindcss', `oxide-${name}`)
+    if (name === omit && !withAddon)
+      continue
+    mkdirSync(dir, { recursive: true })
+    if (name !== omit)
+      writeFileSync(join(dir, `tailwindcss-oxide.${name}.node`), '')
+  }
+  expect(() => verifyRemoteNativeBindings(root)).toThrow(`PLUGIN_DEPLOY_NATIVE_MISSING:
+  @tailwindcss/oxide-${omit}`)
 })

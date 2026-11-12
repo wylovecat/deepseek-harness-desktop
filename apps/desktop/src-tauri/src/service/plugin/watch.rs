@@ -488,6 +488,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// 验证解析插件清单时能正确标记内置预设插件。
     #[test]
     fn parse_plugins_marks_internal_presets() {
         let dir = build_profile(
@@ -506,7 +507,7 @@ mod tests {
             spec: "dsh-tauri@0.2.0".into(),
             name: "DSH Tauri".into(),
             description: "Message bridge".into(),
-            repo_url: "https://github.com/dsh-tauri-desk/dsh-tauri".into(),
+            repo_url: "https://github.com/dsh-tauri/dsh-tauri".into(),
             recommended: true,
             fix: false,
             default_checked: false,
@@ -677,23 +678,23 @@ mod tests {
                     r#"{"name":"dshmarket","version":"1.13.1","dsh":{"bundle":{}}}"#,
                 ),
                 (
-                    "dsh-tauri-pet",
-                    r#"{"name":"dsh-tauri-pet","version":"0.1.0"}"#,
+                    "dsh-tauri-archive",
+                    r#"{"name":"dsh-tauri-archive","version":"0.1.0"}"#,
                 ),
                 ("dsh-other", r#"{"name":"dsh-other","version":"0.1.0"}"#),
             ],
         );
-        // dshmarket 由配置覆盖禁用；dsh-tauri-pet 显式 disabled: false（非禁用）
+        // dshmarket 由配置覆盖禁用；dsh-tauri-archive 显式 disabled: false（非禁用）
         std::fs::write(
             dir.join("cordis.patch.yml"),
-            "- id: dshmarket\n  disabled: true\n- id: dsh-tauri-pet\n  disabled: false\n",
+            "- id: dshmarket\n  disabled: true\n- id: dsh-tauri-archive\n  disabled: false\n",
         )
         .unwrap();
         let plugins = parse_plugins(&dir, &presets_for_test());
         let market = plugins.iter().find(|p| p.id == "dshmarket").unwrap();
         assert!(market.disabled);
-        let pet = plugins.iter().find(|p| p.id == "dsh-tauri-pet").unwrap();
-        assert!(!pet.disabled);
+        let archive = plugins.iter().find(|p| p.id == "dsh-tauri-archive").unwrap();
+        assert!(!archive.disabled);
         let other = plugins.iter().find(|p| p.id == "dsh-other").unwrap();
         assert!(!other.disabled);
 

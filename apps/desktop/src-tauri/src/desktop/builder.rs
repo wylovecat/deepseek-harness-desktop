@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(any(windows, target_os = "macos"))]
 use std::sync::OnceLock;
 use tauri::{Emitter, Manager, Runtime, WebviewUrl, WebviewWindowBuilder, ipc::Invoke};
+use tauri_plugin_window_state::WindowExt;
 use tauri_runtime_electron::ElectronRuntime;
 
 #[cfg(windows)]
@@ -43,61 +44,77 @@ const TRAFFIC_LIGHT_VISUAL_OFFSET: f64 = 2.0;
 
 pub const MAIN_WINDOW_LABEL: &str = "main";
 
+/// 由插件持久化的窗口状态位：只留尺寸、位置与最大化。
+///
+/// 可见性与装饰由本项目自己的壳层控制（自绘窗框、Windows 上先隐藏建窗再 show），交给插件
+/// 恢复会在启动时把窗口抢先显示出来并改写装饰样式，因此刻意不纳入。
+pub const WINDOW_STATE_FLAGS: tauri_plugin_window_state::StateFlags =
+    tauri_plugin_window_state::StateFlags::SIZE
+        .union(tauri_plugin_window_state::StateFlags::POSITION)
+        .union(tauri_plugin_window_state::StateFlags::MAXIMIZED);
+
 static EXTRA_WINDOW_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub fn setup(app_handle: crate::AppHandle) {
-    crate::service::workflow::early::setup(move |prepared| {
-        if !prepared {
-            if let Err(e) = crate::service::plugin::remove_legacy_bundled_plugins(&app_handle) {
-                log::warn!("legacy bundled plugins cleanup skipped: {e}");
-            }
+    if let Err(e) = crate::service::plugin::remove_legacy_bundled_plugins(&app_handle) {
+        log::warn!("legacy bundled plugins cleanup skipped: {e}");
+    }
 
-            crate::service::workflow::sweep_orphan_harness(&app_handle);
+    crate::service::workflow::sweep_orphan_harness(&app_handle);
 
-            let dsh_home = crate::config::get_dsh_data_path(&app_handle);
-            if let Err(e) = crate::service::migrate::heal_stale_pnpm_metadata(&dsh_home) {
-                log::warn!("pnpm modules metadata self-heal skipped: {e}");
-            }
+    // 独立 Node 运行时已废弃：清掉历史安装留下的 `$AppData/runtime`，避免它以
+    // 陈旧文件继续被诊断信息或用户误认为有效运行时。
+    if let Err(e) = crate::service::migrate::remove_legacy_node_runtime(&app_handle) {
+        log::warn!("legacy node runtime cleanup skipped: {e}");
+    }
 
-            crate::service::profile::ensure_desktop_profile(&app_handle);
+    let dsh_home = crate::config::get_dsh_data_path(&app_handle);
+    if let Err(e) = crate::service::migrate::heal_stale_pnpm_metadata(&dsh_home) {
+        log::warn!("pnpm modules metadata self-heal skipped: {e}");
+    }
+
+    if let Err(e) = crate::service::core::retire_directory_core(&app_handle) {
+        log::warn!("legacy directory core retirement skipped: {e}");
+    }
+
+    crate::service::profile::ensure_desktop_profile(&app_handle);
+
+    crate::service::workflow::instances::bind_window(
+        MAIN_WINDOW_LABEL,
+        &crate::service::profile::active_profile(&app_handle),
+    );
+    crate::service::scheduler::start(&app_handle);
+
+    #[cfg(not(debug_assertions))]
+    crate::desktop::deep_link::init(&app_handle);
+
+    let app_for_start = app_handle.clone();
+    tauri::async_runtime::spawn(async move {
+        let setting = crate::config::get_store_dat_setting(&app_for_start);
+        if !setting.auto_start {
+            log::debug!("auto_start disabled, skipping startup");
+            return;
         }
+        let profile =
+            crate::service::workflow::instances::window_profile(&app_for_start, MAIN_WINDOW_LABEL);
+        if let Err(e) = crate::service::workflow::instances::scope(
+            profile,
+            crate::service::workflow::start(app_for_start),
+        )
+        .await
+        {
+            log::error!("start failed: {}", e);
+        }
+    });
 
-        crate::service::workflow::instances::window_profile(&app_handle, MAIN_WINDOW_LABEL);
-        crate::service::scheduler::start(&app_handle);
-
-        #[cfg(not(debug_assertions))]
-        crate::desktop::deep_link::init(&app_handle);
-
-        let app_for_start = app_handle.clone();
-        tauri::async_runtime::spawn(async move {
-            let setting = crate::config::get_store_dat_setting(&app_for_start);
-            if !setting.auto_start {
-                log::debug!("auto_start disabled, skipping startup");
-                return;
-            }
-            let profile = crate::service::workflow::instances::window_profile(
-                &app_for_start,
-                MAIN_WINDOW_LABEL,
-            );
-            if let Err(e) = crate::service::workflow::instances::scope(
-                profile,
-                crate::service::workflow::start(app_for_start),
-            )
-            .await
-            {
-                log::error!("start failed: {}", e);
-            }
-        });
-
-        tauri::async_runtime::spawn(async move {
-            let setting = crate::config::get_store_dat_setting(&app_handle);
-            if !setting.installed || !setting.cli_link_enabled {
-                return;
-            }
-            if let Err(e) = crate::service::cli::ensure(&app_handle) {
-                log::warn!("cli link self-heal failed: {e}");
-            }
-        });
+    tauri::async_runtime::spawn(async move {
+        let setting = crate::config::get_store_dat_setting(&app_handle);
+        if !setting.installed || !setting.cli_link_enabled {
+            return;
+        }
+        if let Err(e) = crate::service::cli::ensure(&app_handle) {
+            log::warn!("cli link self-heal failed: {e}");
+        }
     });
 }
 
@@ -513,9 +530,6 @@ fn help_menu_window_label<'a>(
 ) -> Option<&'a str> {
     let mut main_window = None;
     for (label, focused) in windows {
-        if label == crate::desktop::pet::PET_WINDOW_LABEL {
-            continue;
-        }
         if focused {
             return Some(label);
         }
@@ -533,8 +547,8 @@ mod help_menu_tests {
     #[test]
     fn help_links_prefer_the_focused_shell_window() {
         for windows in [
-            [("main", false), ("window-1", true), ("pet", false)],
-            [("window-1", true), ("main", false), ("pet", false)],
+            [("main", false), ("window-1", true)],
+            [("window-1", true), ("main", false)],
         ] {
             assert_eq!(help_menu_window_label(windows), Some("window-1"));
         }
@@ -545,29 +559,18 @@ mod help_menu_tests {
     }
 
     #[test]
-    fn help_links_fall_back_to_main_when_only_the_pet_is_focused() {
-        assert_eq!(
-            help_menu_window_label([("main", false), ("window-1", false), ("pet", true)]),
-            Some("main")
-        );
-    }
-
-    #[test]
     fn help_links_fall_back_to_main_when_all_windows_are_unfocused() {
         for windows in [
-            [("main", false), ("window-1", false), ("pet", false)],
-            [("window-1", false), ("pet", false), ("main", false)],
+            [("main", false), ("window-1", false)],
+            [("window-1", false), ("main", false)],
         ] {
             assert_eq!(help_menu_window_label(windows), Some("main"));
         }
     }
 
     #[test]
-    fn help_links_never_fall_back_to_a_pet_or_an_arbitrary_extra_window() {
-        assert_eq!(
-            help_menu_window_label([("window-1", false), ("pet", true)]),
-            None
-        );
+    fn help_links_never_fall_back_to_an_arbitrary_extra_window() {
+        assert_eq!(help_menu_window_label([("window-1", false)]), None);
         assert_eq!(help_menu_window_label([]), None);
     }
 }
@@ -586,9 +589,7 @@ pub fn sync_view_menu(
 ) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        if window.label() == crate::desktop::pet::PET_WINDOW_LABEL
-            || !window.is_focused().unwrap_or(false)
-        {
+        if !window.is_focused().unwrap_or(false) {
             return Ok(());
         }
         let Some(menu) = window.app_handle().menu() else {
@@ -636,9 +637,7 @@ pub fn sync_view_menu(
 
 #[cfg(target_os = "macos")]
 fn sync_macos_fullscreen_menu(window: &crate::Window<ElectronRuntime>) {
-    if window.label() == crate::desktop::pet::PET_WINDOW_LABEL
-        || !window.is_focused().unwrap_or(false)
-    {
+    if !window.is_focused().unwrap_or(false) {
         return;
     }
     let Ok(is_fullscreen) = window.is_fullscreen() else {
@@ -740,17 +739,35 @@ fn shell_window_transparent(appearance: &crate::config::Appearance) -> bool {
     }
 }
 
+fn shell_frame_for(transparent: bool) -> bool {
+    transparent && (cfg!(target_os = "linux") || cfg!(windows))
+}
+
+struct NativeNotificationsAvailable(bool);
+
+pub(super) fn native_notifications_script(app: &crate::AppHandle<ElectronRuntime>) -> String {
+    format!(
+        "window.__DSH_NOTIFICATIONS_AVAILABLE__ = {};",
+        app.state::<NativeNotificationsAvailable>().inner().0
+    )
+}
+
 fn with_shell_chrome<'a>(
     app: &'a crate::AppHandle<ElectronRuntime>,
     builder: WebviewWindowBuilder<'a, ElectronRuntime, crate::AppHandle<ElectronRuntime>>,
 ) -> tauri::Result<WebviewWindowBuilder<'a, ElectronRuntime, crate::AppHandle<ElectronRuntime>>> {
     let appearance = crate::config::get_store_dat_setting(app).appearance;
     let transparent = shell_window_transparent(&appearance);
-    let frame = cfg!(target_os = "linux") && transparent;
+    let frame = shell_frame_for(transparent);
+    // Linux 的窗口恒为透明窗，透明度只是前端渲染参数，改设置无需重开；
+    // Windows / macOS 的透明窗在创建时定型，改动必须重启才生效。
+    let live_transparency = cfg!(target_os = "linux");
     let builder = builder
         .transparent(transparent)
+        .initialization_script(native_notifications_script(app))
         .initialization_script(format!(
-            "window.__DSH_TRANSPARENT__ = {transparent}; window.__DSH_FRAME__ = {frame}; window.__DSH_STORE_FILE__ = {};",
+            "window.__DSH_TRANSPARENT__ = {transparent}; window.__DSH_FRAME__ = {frame}; \
+             window.__DSH_LIVE_TRANSPARENCY__ = {live_transparency}; window.__DSH_STORE_FILE__ = {};",
             serde_json::json!(crate::config::store_dat_file_name())
         ))
         .inner_size(1280.0, 840.0)
@@ -806,16 +823,48 @@ fn with_shell_chrome<'a>(
     Ok(builder)
 }
 
+/// 主窗口壳层注入的初始主题：显式偏好直接取；跟随系统时按窗口拿到的系统外观折算。
+fn main_shell_theme(
+    app: &crate::AppHandle<ElectronRuntime>,
+    system: Option<tauri::Theme>,
+) -> crate::desktop::shell::Theme {
+    use crate::desktop::shell::Theme;
+    match crate::config::get_dsh_theme(app) {
+        crate::config::DshTheme::Light => Theme::Light,
+        crate::config::DshTheme::Dark => Theme::Dark,
+        crate::config::DshTheme::System if system == Some(tauri::Theme::Dark) => Theme::Dark,
+        crate::config::DshTheme::System => Theme::Light,
+    }
+}
+
 pub fn build_main_window(
     app: &crate::AppHandle<ElectronRuntime>,
 ) -> tauri::Result<crate::WebviewWindow<ElectronRuntime>> {
     let app_handle = app.clone();
 
-    let _geometry_restore = crate::config::GeometryRestoreGuard::begin();
+    let _geometry_restore = tauri_plugin_window_state::GeometryRestoreGuard::begin();
 
-    let webview_builder =
+    let _host_paths =
+        tauri_runtime_electron::WebviewSetup::new(MAIN_WINDOW_LABEL)
+            .authenticated_web_host_session_key(
+                crate::desktop::session_key::window_authenticated_session_key(app, MAIN_WINDOW_LABEL),
+            )
+            .browser_host()
+            .preload_script(include_str!("preload.js.inc"));
+
+    let mut webview_builder =
         WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::App("index.html".into()))
-            .title(crate::desktop::product_name(app));
+            .title(crate::desktop::product_name(app))
+            .initialization_script(include_str!("browser.js.inc"));
+    if let Some(injection) = (!cfg!(debug_assertions)
+        || cfg!(feature = "dsh-shell-dev")
+        || app.config().build.dev_url.is_none())
+        .then(|| crate::desktop::shell::ShellInjection::new(main_shell_theme(app, None)))
+        .flatten()
+    {
+        webview_builder = webview_builder.initialization_script(injection.source().to_owned());
+    }
+
 
     #[cfg(windows)]
     let webview_builder = webview_builder.visible(false);
@@ -829,20 +878,20 @@ pub fn build_main_window(
             _ => tauri::webview::PermissionResponse::Default,
         })
         .build()?;
+    crate::desktop::window::connect_browser_events(webview_window.as_ref())?;
     tauri_runtime_electron::on_new_window(webview_window.as_ref(), move |url, features| {
         crate::desktop::window::on_new_window(app_handle.clone(), url, features)
     })?;
     #[cfg(windows)]
     apply_windows_window_icon(&webview_window);
     apply_window_background(app, &webview_window);
-    let zoom_factor = crate::config::get_store_dat_setting(app).zoom_factor;
-    if zoom_factor != crate::config::default_zoom_factor() {
-        if let Err(error) = crate::desktop::zoom::apply_native_zoom(&webview_window, zoom_factor) {
-            log::warn!("[zoom] startup zoom was not applied: {error}");
-        }
+    if let Err(error) = crate::desktop::zoom::apply_zoom_on_load(app, &webview_window) {
+        log::warn!("[zoom] document zoom hook was not registered: {error}");
     }
 
-    crate::config::restore_main_window(app, &webview_window);
+    if let Err(error) = webview_window.restore_state(WINDOW_STATE_FLAGS) {
+        log::warn!("[window-state] geometry restore failed: {error}");
+    }
     #[cfg(windows)]
     webview_window.show()?;
 
@@ -876,10 +925,27 @@ pub fn build_shell_window(
 ) -> tauri::Result<crate::WebviewWindow<ElectronRuntime>> {
     let app_handle = app.clone();
 
-    let webview_builder = with_shell_chrome(
+    let _setup = tauri_runtime_electron::WebviewSetup::new(&label)
+        .authenticated_web_host_session_key(
+            crate::desktop::session_key::window_authenticated_session_key(app, &label),
+        )
+        .browser_host()
+        .preload_script(include_str!("preload.js.inc"));
+    let mut webview_builder = with_shell_chrome(
         app,
-        WebviewWindowBuilder::new(app, label, WebviewUrl::App(path)).title(title),
+        WebviewWindowBuilder::new(app, label, WebviewUrl::App(path))
+            .title(title)
+            .initialization_script(include_str!("browser.js.inc")),
     )?;
+    if let Some(injection) = (!cfg!(debug_assertions)
+        || cfg!(feature = "dsh-shell-dev")
+        || app.config().build.dev_url.is_none())
+        .then(|| crate::desktop::shell::ShellInjection::new(main_shell_theme(app, None)))
+        .flatten()
+    {
+        webview_builder = webview_builder.initialization_script(injection.source().to_owned());
+    }
+
     let webview_builder = match navigation_script {
         Some(script) => webview_builder.initialization_script_for_all_frames(script),
         None => webview_builder,
@@ -892,6 +958,7 @@ pub fn build_shell_window(
             _ => tauri::webview::PermissionResponse::Default,
         })
         .build()?;
+    crate::desktop::window::connect_browser_events(window.as_ref())?;
     tauri_runtime_electron::on_new_window(window.as_ref(), move |url, features| {
         crate::desktop::window::on_new_window(app_handle.clone(), url, features)
     })?;
@@ -899,11 +966,8 @@ pub fn build_shell_window(
     apply_windows_window_icon(&window);
     apply_window_background(app, &window);
 
-    let zoom_factor = crate::config::get_store_dat_setting(app).zoom_factor;
-    if zoom_factor != crate::config::default_zoom_factor() {
-        if let Err(error) = crate::desktop::zoom::apply_native_zoom(&window, zoom_factor) {
-            log::warn!("[zoom] extra window zoom was not applied: {error}");
-        }
+    if let Err(error) = crate::desktop::zoom::apply_zoom_on_load(app, &window) {
+        log::warn!("[zoom] document zoom hook was not registered: {error}");
     }
     let _ = window.set_focus();
 
@@ -966,7 +1030,7 @@ mod shell_nav_tests {
     #[test]
     fn shell_nav_height_matches_navbar_height_class() {
         let path =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../src/layout/components/navbar.tsx");
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../src/layout/navbar/navbar.tsx");
         let source = std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("read {} failed: {error}", path.display()));
 
@@ -991,17 +1055,27 @@ mod shell_nav_tests {
 }
 
 #[cfg(test)]
+mod shell_frame_tests {
+    use super::shell_frame_for;
+
+    #[test]
+    fn transparent_shells_draw_their_own_frame_where_the_os_stops_rounding() {
+        assert!(!shell_frame_for(false), "不透明窗沿用系统外框");
+        assert_eq!(
+            shell_frame_for(true),
+            cfg!(target_os = "linux") || cfg!(windows),
+            "Windows 透明窗拿不到 DWM 圆角，Linux 没有装饰边框，两边都要壳层自绘"
+        );
+    }
+}
+
+#[cfg(test)]
 mod menu_tests {
     use super::{fullscreen_menu_label_key, menu_action_window_label};
-    use crate::desktop::pet::PET_WINDOW_LABEL;
 
     #[test]
     fn menu_actions_prefer_the_focused_shell_window_in_any_iteration_order() {
-        let windows = [
-            ("main", false),
-            ("window-1", true),
-            (PET_WINDOW_LABEL, false),
-        ];
+        let windows = [("main", false), ("window-1", true)];
         assert_eq!(menu_action_window_label(windows), Some("window-1"));
         assert_eq!(
             menu_action_window_label(windows.into_iter().rev()),
@@ -1013,18 +1087,6 @@ mod menu_tests {
     fn menu_actions_target_main_when_it_is_focused() {
         assert_eq!(
             menu_action_window_label([("main", true), ("window-1", false)]),
-            Some("main")
-        );
-    }
-
-    #[test]
-    fn menu_actions_fall_back_to_main_when_only_the_pet_is_focused() {
-        assert_eq!(
-            menu_action_window_label([
-                (PET_WINDOW_LABEL, true),
-                ("window-1", false),
-                ("main", false)
-            ]),
             Some("main")
         );
     }
@@ -1047,10 +1109,7 @@ mod menu_tests {
 
     #[test]
     fn menu_actions_have_no_target_without_a_focused_shell_or_main() {
-        assert_eq!(
-            menu_action_window_label([(PET_WINDOW_LABEL, true), ("window-1", false)]),
-            None
-        );
+        assert_eq!(menu_action_window_label([("window-1", false)]), None);
         assert_eq!(menu_action_window_label([]), None);
     }
 
@@ -1069,11 +1128,33 @@ mod security_tests {
         serde_json::from_str(include_str!("../../capabilities/default.json")).unwrap()
     }
 
+    /// 主窗口把 DSH 作为自身文档加载，而 DSH 由本机 HTTP 服务提供（`http://127.0.0.1:PORT`），
+    /// 不属于 Tauri 本地协议，必须由单独的 `hosted-shell` 能力开放——否则 DSH 文档里的壳层
+    /// 调不动任何 IPC（`event.emit_to is not allowed on ...`）。那份能力只允许本机回环；
+    /// 默认能力保持纯本地，不向任何 URL 开放。
     #[test]
-    fn shell_capability_excludes_remote_origins() {
-        let capability = capability();
-        assert!(capability.get("remote").is_none());
-        assert_eq!(capability["local"], true);
+    fn shell_capability_only_trusts_loopback_origins() {
+        let default = capability();
+        assert_eq!(default["local"], true);
+        assert!(
+            default.get("remote").is_none(),
+            "默认能力只服务本地页面，不得开放给任何 URL"
+        );
+
+        let hosted: Value =
+            serde_json::from_str(include_str!("../../capabilities/hosted-shell.json")).unwrap();
+        assert_eq!(hosted["local"], false, "hosted-shell 只对回环页面生效");
+        let urls = hosted["remote"]["urls"]
+            .as_array()
+            .expect("hosted-shell 必须声明 remote.urls");
+        assert!(!urls.is_empty(), "文档即 DSH 时壳层需要在本机 HTTP 源上调 IPC");
+        for url in urls {
+            let pattern = url.as_str().expect("remote.urls 的元素必须是字符串");
+            assert!(
+                pattern.starts_with("http://127.0.0.1:") || pattern.starts_with("http://localhost:"),
+                "remote.urls 只允许本机回环，实际是 {pattern}"
+            );
+        }
     }
 
     #[test]
@@ -1095,7 +1176,7 @@ mod security_tests {
     }
 
     #[test]
-    fn pet_http_scope_is_limited_to_remote_asset_hosts() {
+    fn http_scope_is_limited_to_remote_asset_hosts() {
         let capability = capability();
         let permissions = capability["permissions"]
             .as_array()
@@ -1185,10 +1266,15 @@ mod macos_bundle_tests {
 
 pub fn handler() -> impl Fn(Invoke<ElectronRuntime>) -> bool + Send + Sync + 'static {
     let handler: fn(Invoke<ElectronRuntime>) -> bool = tauri::generate_handler![
+        crate::desktop::window::host_harness_document,
+        crate::desktop::window::begin_harness_restart,
+        crate::desktop::window::get_harness_restart,
+        crate::desktop::window::prepare_harness_restart,
+        crate::desktop::window::resume_harness_restart,
+        crate::desktop::window::finish_harness_restart,
         crate::desktop::window::prepare_harness_webview,
         crate::desktop::window::release_harness_webview,
         crate::desktop::window::update_harness_webview,
-        crate::desktop::window::capture_harness_webview,
         crate::desktop::window::acquire_browser_guest,
         crate::desktop::window::release_browser_guest,
         crate::bridge::install_dependencies,
@@ -1196,7 +1282,6 @@ pub fn handler() -> impl Fn(Invoke<ElectronRuntime>) -> bool + Send + Sync + 'st
         crate::bridge::launch_harness,
         crate::bridge::shutdown_harness,
         crate::bridge::restart_harness,
-        crate::bridge::enter_safe_mode,
         crate::bridge::quarantine_broken_patch_layers,
         crate::bridge::strip_unresolved_patch_entries,
         crate::bridge::get_dsh_status,
@@ -1247,6 +1332,8 @@ pub fn handler() -> impl Fn(Invoke<ElectronRuntime>) -> bool + Send + Sync + 'st
         crate::bridge::delete_backup,
         crate::bridge::get_cores,
         crate::bridge::set_active_core,
+        crate::bridge::get_core_asar,
+        crate::bridge::set_core_asar,
         crate::bridge::download_core,
         crate::bridge::remove_core,
         crate::bridge::update_local_core,
@@ -1284,6 +1371,7 @@ pub fn handler() -> impl Fn(Invoke<ElectronRuntime>) -> bool + Send + Sync + 'st
         crate::bridge::open_desktop_installer,
         crate::bridge::get_desktop_about,
         crate::bridge::open_external_url,
+        crate::bridge::open_in_app,
         crate::bridge::read_clipboard_text,
         crate::bridge::write_clipboard_text,
         crate::desktop::window::create_app_window,
@@ -1291,31 +1379,11 @@ pub fn handler() -> impl Fn(Invoke<ElectronRuntime>) -> bool + Send + Sync + 'st
         crate::desktop::window::quit_app,
         crate::desktop::window::toggle_devtools,
         crate::bridge::log_frontend,
-        crate::bridge::get_pet_status,
-        crate::bridge::pet_show_main_window,
-        crate::bridge::pet_show_context_menu,
-        crate::bridge::get_pet_overlay_supported,
         crate::bridge::get_force_xwayland,
         crate::bridge::set_force_xwayland,
-        crate::bridge::set_pet_enabled,
-        crate::bridge::set_active_pet,
-        crate::bridge::set_pet_size,
-        crate::bridge::set_pet_throw_enabled,
-        crate::bridge::push_pet_session,
-        crate::bridge::move_pet_window,
-        crate::bridge::persist_pet_window_position,
-        crate::bridge::set_pet_ignore_cursor_events,
-        crate::bridge::set_pet_input_region,
-        crate::bridge::list_pets,
-        crate::bridge::import_pet,
-        crate::bridge::delete_pet,
-        crate::bridge::import_pet_repository,
-        crate::bridge::check_pet_updates,
-        crate::bridge::update_pet_repository,
-        crate::bridge::get_pet_asset,
-        crate::bridge::list_preset_pets,
-        crate::desktop::pet_mouse::start_pet_mouse_stream,
         crate::bridge::remote::remote,
+        crate::bridge::remote::navigate_remote_harness,
+        crate::bridge::remote::get_remote_shell_state,
         crate::bridge::remote_bridge_ping,
         crate::bridge::remote_open_window,
     ];
@@ -1342,23 +1410,9 @@ fn guest_command_allowed(command: &str) -> bool {
             | "acquire_browser_guest"
             | "release_browser_guest"
             | "open_external_url"
-            | "get_pet_status"
-            | "get_pet_overlay_supported"
+            | "open_in_app"
             | "get_force_xwayland"
             | "set_force_xwayland"
-            | "set_pet_enabled"
-            | "set_active_pet"
-            | "set_pet_size"
-            | "set_pet_throw_enabled"
-            | "push_pet_session"
-            | "list_pets"
-            | "import_pet"
-            | "delete_pet"
-            | "import_pet_repository"
-            | "check_pet_updates"
-            | "update_pet_repository"
-            | "get_pet_asset"
-            | "list_preset_pets"
             | "remote_bridge_ping"
             | "remote_open_window"
             | "create_app_window"
@@ -1374,10 +1428,12 @@ fn guest_command_scope_preserves_plugin_actions_and_blocks_shell_control() {
     assert!(guest_command_allowed("create_app_window"));
     assert!(guest_command_allowed("acquire_browser_guest"));
     assert!(guest_command_allowed("release_browser_guest"));
+    assert!(guest_command_allowed("open_in_app"));
     assert!(guest_command_allowed("read_clipboard_text"));
     assert!(guest_command_allowed("write_clipboard_text"));
     assert!(guest_command_allowed("report_plugin_error"));
     for command in [
+        "host_harness_document",
         "prepare_harness_webview",
         "release_harness_webview",
         "update_harness_webview",
@@ -1394,9 +1450,6 @@ fn menu_action_window_label<'a>(
 ) -> Option<&'a str> {
     let mut main = None;
     for (label, focused) in windows {
-        if label == crate::desktop::pet::PET_WINDOW_LABEL {
-            continue;
-        }
         if focused {
             return Some(label);
         }
@@ -1413,7 +1466,6 @@ pub fn builder() -> tauri::Builder<ElectronRuntime> {
         .plugin(tauri_runtime_electron::window::init());
 
     let builder = builder
-        .manage(crate::desktop::pet_mouse::PetMouseStreamState::default())
         .setup(|app| {
             let app_handle = app.handle().clone();
             crate::desktop::autostart::init(&app_handle)?;
@@ -1424,21 +1476,10 @@ pub fn builder() -> tauri::Builder<ElectronRuntime> {
             #[cfg(target_os = "macos")]
             install_macos_menu(&app_handle)?;
             tray(&app_handle)?;
-            crate::desktop::pet::init_pet_window(&app_handle);
             setup(app_handle.clone());
-            crate::bridge::pet::sync_pet_session_stream(
-                &app_handle,
-                crate::bridge::pet::pet_stream_wanted(&app_handle),
-            );
             Ok(())
         })
         .on_menu_event(|app, event| match event.id().as_ref() {
-            "pet-show-main-window" => show_main_window(app),
-            "pet-close" => {
-                if let Err(error) = crate::bridge::set_pet_enabled(app.clone(), false) {
-                    log::error!("PET_CLOSE_FAILED: {error}");
-                }
-            }
             "desktop-toggle-sidebar"
             | "desktop-toggle-right-panel"
             | "desktop-open-terminal"
@@ -1447,15 +1488,14 @@ pub fn builder() -> tauri::Builder<ElectronRuntime> {
             | "desktop-zoom-out"
             | "desktop-zoom-reset"
             | "desktop-task-manager" => {
-                if let Some(window) = app.windows().into_values().find(|window| {
-                    window.label() != crate::desktop::pet::PET_WINDOW_LABEL
-                        && window.is_focused().unwrap_or(false)
-                }) {
-                    if let Err(error) =
+                if let Some(window) = app
+                    .windows()
+                    .into_values()
+                    .find(|window| window.is_focused().unwrap_or(false))
+                    && let Err(error) =
                         app.emit_to(window.label(), "macos-menu-action", event.id().as_ref())
-                    {
-                        log::warn!("[menu] failed to emit View action: {error}");
-                    }
+                {
+                    log::warn!("[menu] failed to emit View action: {error}");
                 }
             }
             "desktop-documentation" | "desktop-feedback" | "desktop-harness-feedback" => {
@@ -1476,10 +1516,11 @@ pub fn builder() -> tauri::Builder<ElectronRuntime> {
             }
             #[cfg(target_os = "macos")]
             "desktop-fullscreen" => {
-                if let Some(window) = app.windows().into_values().find(|window| {
-                    window.label() != crate::desktop::pet::PET_WINDOW_LABEL
-                        && window.is_focused().unwrap_or(false)
-                }) {
+                if let Some(window) = app
+                    .windows()
+                    .into_values()
+                    .find(|window| window.is_focused().unwrap_or(false))
+                {
                     if let Err(error) = window
                         .is_fullscreen()
                         .and_then(|is_fullscreen| window.set_fullscreen(!is_fullscreen))
@@ -1520,14 +1561,6 @@ pub fn builder() -> tauri::Builder<ElectronRuntime> {
         })
         .on_window_event(|window, event| match event {
             tauri::WindowEvent::CloseRequested { api, .. } => {
-                if window.label() == crate::desktop::pet::PET_WINDOW_LABEL {
-                    api.prevent_close();
-                    let handle = window.app_handle().clone();
-                    if let Err(error) = crate::bridge::pet::set_pet_enabled(handle, false) {
-                        log::warn!("[pet] PET_WINDOW_DESTROY_FAILED: {error}");
-                    }
-                    return;
-                }
                 if window.label() != MAIN_WINDOW_LABEL {
                     return;
                 }
@@ -1550,7 +1583,10 @@ pub fn builder() -> tauri::Builder<ElectronRuntime> {
                 let _ = window.hide();
             }
             tauri::WindowEvent::Destroyed => {
-                crate::desktop::window::forget_harness_documents(window.app_handle(), window.label());
+                crate::desktop::window::forget_harness_documents(
+                    window.app_handle(),
+                    window.label(),
+                );
                 if let Some(profile) =
                     crate::service::workflow::instances::release_window(window.label())
                 {
@@ -1558,38 +1594,23 @@ pub fn builder() -> tauri::Builder<ElectronRuntime> {
                     tauri::async_runtime::spawn(async move {
                         if let Ok(_transition) =
                             crate::service::workflow::acquire_core_transition().await
+                            && !crate::service::workflow::instances::is_attached(&profile)
                         {
-                            if !crate::service::workflow::instances::is_attached(&profile) {
-                                let _ = crate::service::workflow::instances::scope(
-                                    profile,
-                                    crate::service::workflow::stop(app),
-                                )
-                                .await;
-                            }
+                            let _ = crate::service::workflow::instances::scope(
+                                profile,
+                                crate::service::workflow::stop(app),
+                            )
+                            .await;
                         }
                     });
                 }
             }
-            tauri::WindowEvent::ScaleFactorChanged { .. } => {
-                if window.label() == crate::desktop::pet::PET_WINDOW_LABEL {
-                    crate::desktop::pet::apply_pet_size(window.app_handle());
-                }
-            }
-            tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_) => {
-                match window.label() {
-                    label if label == crate::desktop::pet::PET_WINDOW_LABEL => {
-                        crate::desktop::pet::save_pet_window_geometry(window);
-                    }
-                    label if label == MAIN_WINDOW_LABEL => crate::config::save_geometry(window),
-                    _ => {}
-                }
+            tauri::WindowEvent::Resized(_) => {
                 #[cfg(target_os = "macos")]
                 {
-                    if matches!(event, tauri::WindowEvent::Resized(_)) {
-                        sync_macos_fullscreen_menu(window);
-                        if window.label() == MAIN_WINDOW_LABEL {
-                            crate::desktop::activation::on_window_resized(window);
-                        }
+                    sync_macos_fullscreen_menu(window);
+                    if window.label() == MAIN_WINDOW_LABEL {
+                        crate::desktop::activation::on_window_resized(window);
                     }
                 }
             }
@@ -1604,6 +1625,18 @@ pub fn builder() -> tauri::Builder<ElectronRuntime> {
     }));
 
     let builder = builder
+        .plugin(
+            tauri_plugin_window_state::Builder::new()
+                .with_state_flags(WINDOW_STATE_FLAGS)
+                .with_filter(|label| label == MAIN_WINDOW_LABEL)
+                .skip_initial_state(MAIN_WINDOW_LABEL)
+                .with_legacy_store(
+                    crate::config::store_dat_file_name(),
+                    crate::config::STORE_WINDOW_STATE_KEY,
+                    MAIN_WINDOW_LABEL,
+                )
+                .build(),
+        )
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_fs::init())
@@ -1617,10 +1650,11 @@ pub fn builder() -> tauri::Builder<ElectronRuntime> {
         .unwrap_or(false);
     #[cfg(not(target_os = "macos"))]
     let in_app_bundle = true;
+    let builder = builder.manage(NativeNotificationsAvailable(in_app_bundle));
     let builder = if in_app_bundle {
         builder.plugin(tauri_plugin_notifications::init())
     } else {
-        log::warn!(
+        log::info!(
             "未运行在 .app 包内，跳过 tauri-plugin-notifications：macOS 的系统通知需要 .app 包，\
              打包后自动生效"
         );

@@ -252,13 +252,12 @@ fn validate_download_url(url: &str) -> Result<(), String> {
     let trusted_host = matches!(
         parsed.host_str(),
         Some(
-            "nodejs.org"
-                | "registry.npmjs.org"
+            "registry.npmjs.org"
                 | "github.com"
                 | "release-assets.githubusercontent.com"
                 | "objects.githubusercontent.com"
-                // 国内镜像：npmmirror 系列（node dist 会 302 到 cdn.npmmirror.com）
-                // 与 GitHub Release 代理（原样透传，重定向后仍落在镜像自身域名）
+                // 国内镜像：npm registry 镜像与 GitHub Release 代理
+                // （原样透传，重定向后仍落在镜像自身域名）
                 | "npmmirror.com"
                 | "cdn.npmmirror.com"
                 | "registry.npmmirror.com"
@@ -291,36 +290,6 @@ pub fn verify_sha256(buffer: &[u8], expected: &str) -> Result<(), String> {
         ));
     }
     Ok(())
-}
-
-/// 从 Node.js 官方同版本 SHASUMS256.txt 中读取当前平台包的摘要。
-pub async fn fetch_node_sha256(app_handle: &crate::AppHandle, download_url: &str) -> Result<String, String> {
-    let (base, filename) = download_url.rsplit_once('/').ok_or_else(|| {
-        "INTEGRITY_METADATA_INVALID: Node.js download URL has no filename".to_string()
-    })?;
-    let checksums_url = format!("{base}/SHASUMS256.txt");
-    let checksums = crate::config::proxy::http_client_builder(app_handle)?
-        .user_agent("deepseek-harness-desktop")
-        .timeout(Duration::from_secs(20))
-        .build()
-        .map_err(|e| format!("INTEGRITY_METADATA_FAILED: {e}"))?
-        .get(&checksums_url)
-        .send()
-        .await
-        .map_err(|e| format!("INTEGRITY_METADATA_FAILED: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("INTEGRITY_METADATA_FAILED: {e}"))?
-        .text()
-        .await
-        .map_err(|e| format!("INTEGRITY_METADATA_FAILED: {e}"))?;
-
-    checksums
-        .lines()
-        .filter_map(|line| line.split_once(char::is_whitespace))
-        .find_map(|(digest, name)| {
-            (name.trim_start_matches([' ', '*']) == filename).then(|| digest.to_string())
-        })
-        .ok_or_else(|| format!("INTEGRITY_METADATA_MISSING: no checksum for {filename}"))
 }
 
 /// 删除目录并等待 Windows 文件锁释放。
@@ -449,11 +418,9 @@ async fn commit_staged_install(staging: &Path, dest: &Path, backup: &Path) -> Re
             dest.display()
         ));
     }
-    if had_previous {
-        if let Err(e) = remove_path_if_exists(backup).await {
-            // 新版本已经切换成功，备份清理失败不应把成功安装误报为失败。
-            log::warn!("Failed to remove previous installation backup: {e}");
-        }
+    if had_previous && let Err(e) = remove_path_if_exists(backup).await {
+        // 新版本已经切换成功，备份清理失败不应把成功安装误报为失败。
+        log::warn!("Failed to remove previous installation backup: {e}");
     }
     Ok(())
 }
@@ -594,15 +561,15 @@ mod tests {
         assert!(verify_sha256(b"abc", "not-a-digest").is_err());
     }
 
+    /// 校验下载源仅放行 HTTPS 协议与白名单域名（含官方源、镜像代理与 Node/pnpm 镜像源）。
     #[test]
     fn download_sources_are_https_and_allowlisted() {
-        assert!(validate_download_url("https://nodejs.org/dist/v22/file.zip").is_ok());
+        assert!(validate_download_url("https://nodejs.org/dist/v22/file.zip").is_err());
         assert!(validate_download_url("https://registry.npmjs.org/pnpm/-/pnpm.tgz").is_ok());
         assert!(validate_download_url(
             "https://github.com/git-for-windows/git/releases/download/v2.53.0.windows.2/MinGit-2.53.0.2-64-bit.zip"
         )
         .is_ok());
-        assert!(validate_download_url("http://nodejs.org/dist/file.zip").is_err());
         assert!(validate_download_url("https://example.com/file.zip").is_err());
         // 国内镜像源（含 npmmirror 302 后的最终落地域名）
         assert!(validate_download_url("https://npmmirror.com/mirrors/node/v22/file.zip").is_ok());
@@ -613,7 +580,7 @@ mod tests {
         for prefix in crate::config::DSH_MIRROR_PREFIXES {
             assert!(
                 validate_download_url(&format!(
-                    "{prefix}https://github.com/dsh-tauri-desk/deepseek-harness-pkg/releases/latest/download/deepseek-harness-pkg-windows.zip"
+                    "{prefix}https://github.com/dsh-tauri/deepseek-harness-pkg/releases/latest/download/deepseek-harness-pkg-windows.zip"
                 ))
                 .is_ok(),
                 "镜像前缀应被放行: {prefix}"

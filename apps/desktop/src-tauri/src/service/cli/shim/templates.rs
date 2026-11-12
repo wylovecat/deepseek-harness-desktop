@@ -10,81 +10,49 @@
 //! format! 的参数占位符区分）。
 
 // ---------------------------------------------------------------------------
-// shim 共享片段：node 解析逻辑（dsh / pnpm shim 共用）
+// shim 共享片段：node 解析逻辑（dsh / pnpm / npm / npx shim 共用）
 //
-// 规则：优先 `DSH_NODE` 环境变量（桌面端注入其已解析并核验过的 node 路径，
-// 保证 shim 与应用预检一致），其次 PATH 中版本兼容的本地 node（v22.19+ /
-// v24+，与 config::is_supported_node_version 一致），否则回退捆绑
-// 运行时。`DSH_NODE` 只在桌面端自身派生的子进程里存在，终端用户环境不受影响。
+// 运行时只有一个：随包分发的 Electron，以 Node 模式运行（ELECTRON_RUN_AS_NODE=1）。
+// 没有独立 Node 运行时，也不再去 PATH 里挑本地 node —— 那会让 shim 与桌面端
+// 实际拉起的运行时分叉，且本地 node 的 ABI 未必能加载核心的原生模块。
+//
+// 顺序：桌面端注入的 DSH_NODE（与宿主同一二进制）> 已烘焙的 NODE_BIN。
+// 两者都要显式置上 ELECTRON_RUN_AS_NODE，否则 Electron 会当 GUI 启动。
+// DSH_NODE 只在桌面端自身派生的子进程里存在，终端用户环境不受影响。
+//
+// 唯一的例外是 node 启动器（`node` / `node.cmd`）：它在 DSH_NODE 缺失时先转发
+// 用户自己的 node，避免把系统 node 抢成随包 Electron，见本文件的
+// `CMD_USER_NODE_PRECEDENCE` / `SH_USER_NODE_PRECEDENCE`（issue #1486）。
 // ---------------------------------------------------------------------------
 
 pub(super) const CMD_NODE_RESOLVE: &str = r#"
-rem Prefer the desktop-resolved node (DSH_NODE, injected by the app into its
-rem own child processes), then a version-compatible local node, then the
-rem bundled runtime. DSH_NODE makes the shim and the app's pre-check agree:
-rem the app verified the node exists before spawning the child, and the shim
-rem must not re-derive it from PATH (which can miss nodes the app found).
-rem Pure batch version check (for /f tokens + numeric compare), no powershell
-rem child: avoids console flashes when invoked without a console and skips the
-rem per-call powershell startup cost.
+rem The only runtime is the bundled Electron in Node mode. DSH_NODE (injected by
+rem the app into its own child processes) wins so the shim and the app agree;
+rem otherwise fall back to the baked path. ELECTRON_RUN_AS_NODE is mandatory:
+rem without it Electron starts its GUI instead of running the script.
+set "ELECTRON_RUN_AS_NODE=1"
 if not defined DSH_NODE goto :skip_dsh_node
 set "NODE=%DSH_NODE%"
-rem Windows canonical paths may carry a \\?\ verbatim prefix that cmd.exe
+rem Windows canonical paths may carry a \\\\?\\ verbatim prefix that cmd.exe
 rem cannot launch directly; strip it before checking/using the path.
 if "%NODE:~0,4%"=="\\?\" set "NODE=%NODE:~4%"
 if exist "%NODE%" goto :launch
 :skip_dsh_node
-where node >nul 2>nul
-if errorlevel 1 goto :use_bundled
-set "NODE_VERSION="
-for /f "delims=" %%v in ('node --version 2^>nul ^| findstr /r /x "v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*"') do set "NODE_VERSION=%%v"
-if not defined NODE_VERSION goto :use_bundled
-for /f "tokens=1,2 delims=v." %%a in ("%NODE_VERSION%") do set "NODE_MAJOR=%%a" & set "NODE_MINOR=%%b"
-if not defined NODE_MAJOR goto :use_bundled
-if %NODE_MAJOR% GEQ 24 goto :node_ok
-if %NODE_MAJOR% EQU 22 if defined NODE_MINOR if %NODE_MINOR% GEQ 19 goto :node_ok
-goto :use_bundled
-
-:node_ok
-set "NODE=node"
-goto :launch
-
-:node_dsh
-set "NODE=%DSH_NODE%"
-goto :launch
-
-:use_bundled
 if not exist "%NODE_BIN%" goto :no_node
 set "NODE=%NODE_BIN%"
 set "PATH=%NODE_DIR%;%PATH%"
 "#;
 
 pub(super) const PS1_NODE_RESOLVE: &str = r#"
-# Prefer the desktop-resolved node (DSH_NODE, injected by the app into its
-# own child processes), then a version-compatible local node, then the
-# bundled runtime — see the CMD shim for why DSH_NODE wins first.
+# The only runtime is the bundled Electron in Node mode — see the CMD shim for
+# why DSH_NODE wins and why ELECTRON_RUN_AS_NODE is mandatory.
 $node = $null
 if ($env:DSH_NODE) {
     $node = $env:DSH_NODE
-    # Windows canonical paths may carry a \\?\ verbatim prefix; strip it so
+    # Windows canonical paths may carry a \\\\?\\ verbatim prefix; strip it so
     # PowerShell/cmd can launch the path directly.
-    if ($node.StartsWith('\\?\')) { $node = $node.Substring(4) }
+    if ($node.StartsWith('\\\\?\\')) { $node = $node.Substring(4) }
     if (-not (Test-Path -LiteralPath $node)) { $node = $null }
-}
-if (-not $node) {
-    $localNode = Get-Command node -ErrorAction SilentlyContinue
-    if ($localNode) {
-        try {
-            $version = & node --version 2>$null
-            if ($version -match '^v(\d+)\.(\d+)\.(\d+)$') {
-                $major = [int]$matches[1]
-                $minor = [int]$matches[2]
-                if (($major -eq 22 -and $minor -ge 19) -or $major -ge 24) {
-                    $node = 'node'
-                }
-            }
-        } catch { }
-    }
 }
 if (-not $node) {
     if (Test-Path -LiteralPath $nodeBin) {
@@ -93,29 +61,18 @@ if (-not $node) {
     }
 }
 if (-not $node) {
-    Write-Error 'Node.js runtime not found. Please run DeepSeek Harness Desktop to install it first.'
+    Write-Error 'Runtime not found. Please run DeepSeekRuntime Desktop to install it first.'
     exit 1
 }
+$env:ELECTRON_RUN_AS_NODE = '1'
 "#;
 
 pub(super) const SH_NODE_RESOLVE: &str = r#"
 NODE=""
-# Prefer the desktop-resolved node (DSH_NODE, injected by the app into its
-# own child processes), then a version-compatible local node, then the
-# bundled runtime — see the CMD shim for why DSH_NODE wins first.
+# The only runtime is the bundled Electron in Node mode — see the CMD shim for
+# why DSH_NODE wins and why ELECTRON_RUN_AS_NODE is mandatory.
 if [ -n "$DSH_NODE" ] && [ -x "$DSH_NODE" ]; then
   NODE="$DSH_NODE"
-fi
-if [ -z "$NODE" ] && command -v node >/dev/null 2>&1; then
-  NODE_V=$(node --version 2>/dev/null)
-  if printf '%s\n' "$NODE_V" | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ { exit 0 } { exit 1 }'; then
-    MAJOR=$(printf '%s' "$NODE_V" | awk -F. '{ gsub(/^v/, "", $1); print $1 }')
-    MINOR=$(printf '%s' "$NODE_V" | awk -F. '{ print $2 }')
-    if { [ -n "$MAJOR" ] && [ "$MAJOR" -ge 24 ]; } 2>/dev/null || \
-       { [ "$MAJOR" -eq 22 ] && [ "$MINOR" -ge 19 ]; } 2>/dev/null; then
-      NODE="node"
-    fi
-  fi
 fi
 if [ -z "$NODE" ]; then
   if [ -x "$NODE_BIN" ]; then
@@ -124,8 +81,84 @@ if [ -z "$NODE" ]; then
   fi
 fi
 if [ -z "$NODE" ]; then
-  echo "Node.js runtime not found. Please run DeepSeek Harness Desktop to install it first." >&2
+  echo "Runtime not found. Please run DeepSeekRuntime Desktop to install it first." >&2
   exit 1
+fi
+export ELECTRON_RUN_AS_NODE=1
+"#;
+
+// ---------------------------------------------------------------------------
+// node 启动器专用片段：用户自己的 node 优先（issue #1486）
+//
+// `node` 这个名字在用户 PATH 上一旦落到本应用，其它应用/终端拉起的 node 就被
+// 换成了随包 Electron（macOS 上还会多出 Dock 的 exec 图标）。因此 node 启动器
+// 在 DSH_NODE 不可用时先转发 PATH 上用户自己的 node（跳过本 shim 目录），只有
+// 用户机器确实没有 node 时才回退到烘焙的 Electron——「隔离」即由此实现：应用
+// 自己的子进程永远带 DSH_NODE，行为不变；终端里没有 DSH_NODE，于是仍是系统 node。
+//
+// 转发用户 node 时不追加 `--expose-internals`、也不置 `ELECTRON_RUN_AS_NODE`：
+// 两者都是随包 Electron 的启动参数，不该泄漏给用户自己的运行时。dsh/pnpm/npm/npx
+// shim 不引入这段：它们运行核心与包管理器，必须与随包运行时保持一致。
+// ---------------------------------------------------------------------------
+
+pub(super) const CMD_USER_NODE_PRECEDENCE: &str = r#"
+rem DSH_NODE (injected by the app into its own child processes) wins, so the
+rem launcher and the app keep using the same runtime. Without it, hand the call
+rem to the user-installed node on PATH instead of taking over the `node` command
+rem of a terminal or another app; the baked Electron is the last resort.
+set "NODE="
+if defined DSH_NODE set "NODE=%DSH_NODE%"
+if not defined NODE goto :search_user_node
+rem Windows canonical paths may carry a \\?\ verbatim prefix that cmd.exe
+rem cannot launch directly; strip it before checking/using the path.
+if "%NODE:~0,4%"=="\\?\" set "NODE=%NODE:~4%"
+if not exist "%NODE%" set "NODE="
+if defined NODE goto :launch
+:search_user_node
+set "SELF_PREFIX=%~dp0"
+set "SELF_PREFIX=%SELF_PREFIX:~0,-1%"
+set "USER_NODE="
+for /f "delims=" %%n in ('where node 2^>nul') do (
+  if not defined USER_NODE (
+    if /i not "%%n"=="%SELF_PREFIX%\node.cmd" (
+      if /i not "%%n"=="%SELF_PREFIX%\node.exe" (
+        if /i not "%%n"=="%SELF_PREFIX%\node.bat" (
+          if /i "%%~xn"==".cmd" set "USER_NODE=%%n"
+          if /i "%%~xn"==".exe" set "USER_NODE=%%n"
+          if /i "%%~xn"==".bat" set "USER_NODE=%%n"
+        )
+      )
+    )
+  )
+)
+if not defined USER_NODE goto :after_user_node
+rem Forward as-is: --expose-internals and ELECTRON_RUN_AS_NODE belong to the
+rem bundled Electron, not to the user runtime.
+"%USER_NODE%" %*
+exit /b %ERRORLEVEL%
+:after_user_node
+"#;
+
+#[cfg_attr(windows, allow(dead_code))] // 仅 Unix node 启动器使用
+pub(super) const SH_USER_NODE_PRECEDENCE: &str = r#"
+NODE=""
+if [ -n "$DSH_NODE" ] && [ -x "$DSH_NODE" ]; then
+  NODE="$DSH_NODE"
+fi
+if [ -z "$NODE" ]; then
+  remaining_path=${PATH-}:
+  while [ -n "$remaining_path" ]; do
+    dir=${remaining_path%%:*}
+    remaining_path=${remaining_path#*:}
+    dir=${dir:-.}
+    if [ "$dir/node" -ef "$0" ]; then
+      continue
+    fi
+    if [ -x "$dir/node" ]; then
+      exec "$dir/node" "$@"
+    fi
+  done
+  unset remaining_path
 fi
 "#;
 

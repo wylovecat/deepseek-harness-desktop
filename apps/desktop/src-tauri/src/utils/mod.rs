@@ -1,72 +1,10 @@
 use crate::{AppHandle, Window};
+#[cfg(any(windows, target_os = "linux"))]
 use std::path::Path;
 #[cfg(windows)]
 use std::path::PathBuf;
 
 use tauri::{ Manager, Runtime};
-
-use crate::service::core::active_core_dir;
-
-/// 对某个 dsh 包文件的一次性幂等补丁判定结果。
-#[derive(Debug, PartialEq, Eq)]
-pub enum PatchOutcome {
-    /// 目标已含补丁标记（本补丁已生效，或上游官方已合并），无需再改。
-    AlreadyPatched,
-    /// 锚点缺失（上游布局变更），跳过并向调用方说明降级兜底。
-    AnchorMissing,
-    /// 已生成补丁后的完整内容。
-    Patched(String),
-}
-
-/// 对活动核心安装目录下的某个 dsh 包文件应用一次性幂等补丁。
-///
-/// - `rel_path`：相对活动核心安装目录的包内路径，例如
-///   `node_modules/@deepseek-ai/dsh-client-ui-renderer/lib/client.js`（即 `patch_dsh("packagename/xxx/xxx.js", ..)` 里的包路径）。
-/// - `patch`：纯函数式补丁判定，输入文件原文、返回 [`PatchOutcome`]；只做内容变换，
-///   不触碰文件系统，便于单测。
-///
-/// 统一处理「定位文件 → 读取 → 打补丁 → 写回」与对应的日志。文件缺失、已打过、
-/// 锚点变更均静默跳过并返回 Ok；只有真实读/写失败才返回 Err（不阻断启动的调用方
-/// 据此仅告警）。活动核心的判定与 [`active_core_dir`] 一致。
-pub fn patch_dsh(
-    app_handle: &crate::AppHandle,
-    rel_path: &str,
-    patch: impl FnOnce(&str) -> PatchOutcome,
-) -> Result<(), String> {
-    patch_core_file(&active_core_dir(app_handle), rel_path, patch)
-}
-
-/// [`patch_dsh`] 的目录版本：对显式给定的核心安装目录施加同一个补丁。
-///
-/// 供 E2E 编排复用——那条链路没有运行中的桌面端，拿不到 `AppHandle`，
-/// 但必须让被测核心与本应用装配出的核心保持同一份补丁。
-pub fn patch_core_file(
-    core_dir: &Path,
-    rel_path: &str,
-    patch: impl FnOnce(&str) -> PatchOutcome,
-) -> Result<(), String> {
-    let target = core_dir.join(rel_path);
-    if !target.exists() {
-        log::info!("dsh patch target not found, skip: {}", target.display());
-        return Ok(());
-    }
-    let source = std::fs::read_to_string(&target)
-        .map_err(|e| format!("DSH_PATCH_READ: {} failed: {e}", target.display()))?;
-    match patch(&source) {
-        PatchOutcome::AlreadyPatched => {
-            log::info!("dsh patch already applied: {}", target.display());
-        }
-        PatchOutcome::AnchorMissing => {
-            log::warn!("dsh patch anchor missing, skip: {}", target.display());
-        }
-        PatchOutcome::Patched(patched) => {
-            std::fs::write(&target, patched)
-                .map_err(|e| format!("DSH_PATCH_WRITE: {} failed: {e}", target.display()))?;
-            log::info!("dsh patch applied: {}", target.display());
-        }
-    }
-    Ok(())
-}
 
 pub fn show_window<R: Runtime>(window: &Window<R>) {
     let _ = window.unminimize();
@@ -284,11 +222,147 @@ pub(crate) fn console_code_page() -> u32 {
     65001
 }
 
+/// issue #1064：AppImage 的 `$APPDIR` 旧库经 `LD_LIBRARY_PATH` 置顶后，会随环境
+/// 泄漏给子进程；子进程里的宿主二进制（目录选择器、git/pnpm）于是绑定到镜像内
+/// 更旧的版本符号集，出现 `no version information available`、
+/// `version 'NSSUTIL_3.108' not found`、`OPENSSL_3.5.0 not found`（#1299/#1407）
+/// 一类的加载失败。这里把位于 `$APPDIR` 之下的条目从库搜索路径中剔除。
+#[cfg(target_os = "linux")]
+pub(crate) fn child_library_path(
+    appdir: Option<&std::ffi::OsStr>,
+    library_path: Option<&std::ffi::OsStr>,
+) -> Option<std::ffi::OsString> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let library_path = library_path?;
+    let Some(appdir) = appdir.filter(|path| !path.is_empty()) else {
+        return Some(library_path.to_os_string());
+    };
+    Some(
+        std::env::join_paths(
+            library_path
+                .as_bytes()
+                .split(|byte| matches!(*byte, b':' | b';'))
+                .map(|path| Path::new(std::ffi::OsStr::from_bytes(path)))
+                .filter(|path| !path.starts_with(Path::new(appdir))),
+        )
+        .expect("split Linux library paths contain no path separator"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use super::child_library_path;
     use super::decode_process_line;
     #[cfg(windows)]
     use super::{decode_multibyte, encode_multibyte, short_path};
+
+    #[cfg(target_os = "linux")]
+    mod appimage_library_path {
+        use super::child_library_path;
+        use std::ffi::{OsStr, OsString};
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        #[test]
+        fn removes_only_appimage_library_directories() {
+            assert_eq!(
+                child_library_path(
+                    Some(OsStr::new("/tmp/.mount_DSH")),
+                    Some(OsStr::new("/opt/custom/lib:/tmp/.mount_DSH/usr/lib:/tmp/.mount_DSH:/tmp/.mount_DSH-other/lib:")),
+                ),
+                Some(OsString::from("/opt/custom/lib:/tmp/.mount_DSH-other/lib:")),
+            );
+        }
+
+        #[test]
+        fn filters_semicolon_and_mixed_library_path_separators() {
+            for path in [
+                "/opt/custom/lib;/tmp/.mount_DSH/usr/lib",
+                "/tmp/.mount_DSH/usr/lib;/opt/custom/lib",
+                "/tmp/.mount_DSH/usr/lib:/opt/custom/lib;/tmp/.mount_DSH/usr/lib64",
+            ] {
+                assert_eq!(
+                    child_library_path(Some(OsStr::new("/tmp/.mount_DSH")), Some(OsStr::new(path))),
+                    Some(OsString::from("/opt/custom/lib")),
+                    "{path}",
+                );
+            }
+        }
+
+        #[test]
+        fn retains_empty_components_and_loader_tokens() {
+            assert_eq!(
+                child_library_path(
+                    Some(OsStr::new("/tmp/.mount_DSH")),
+                    Some(OsStr::new(";/tmp/.mount_DSH/usr/lib;;$ORIGIN/$LIB:;")),
+                ),
+                Some(OsString::from("::$ORIGIN/$LIB::")),
+            );
+        }
+
+        #[test]
+        fn filters_non_utf8_appimage_paths_without_removing_siblings() {
+            assert_eq!(
+                child_library_path(
+                    Some(OsStr::from_bytes(b"/tmp/.mount_\xff")),
+                    Some(OsStr::from_bytes(
+                        b"/tmp/.mount_\xff/usr/lib;/opt/\xfe/lib:/tmp/.mount_\xff-other/lib"
+                    )),
+                ),
+                Some(OsString::from_vec(
+                    b"/opt/\xfe/lib:/tmp/.mount_\xff-other/lib".to_vec()
+                )),
+            );
+        }
+
+        #[test]
+        fn preserves_library_path_without_an_appimage_directory() {
+            let path = Some(OsStr::new("/opt/custom/lib"));
+            assert_eq!(
+                child_library_path(None, path),
+                Some(OsString::from("/opt/custom/lib"))
+            );
+            assert_eq!(
+                child_library_path(Some(OsStr::new("")), path),
+                Some(OsString::from("/opt/custom/lib"))
+            );
+        }
+
+        #[test]
+        fn preserves_an_unset_library_path() {
+            assert_eq!(
+                child_library_path(Some(OsStr::new("/tmp/.mount_DSH")), None),
+                None
+            );
+        }
+
+        #[test]
+        fn clears_a_library_path_containing_only_appimage_directories() {
+            for path in [
+                "/tmp/.mount_DSH/usr/lib",
+                "/tmp/.mount_DSH/usr/lib;/tmp/.mount_DSH/usr/lib64",
+                "",
+            ] {
+                assert_eq!(
+                    child_library_path(Some(OsStr::new("/tmp/.mount_DSH")), Some(OsStr::new(path))),
+                    Some(OsString::new()),
+                    "{path}",
+                );
+            }
+        }
+
+        #[test]
+        fn preserves_non_utf8_user_library_paths() {
+            assert_eq!(
+                child_library_path(
+                    Some(OsStr::new("/tmp/.mount_DSH")),
+                    Some(OsStr::from_bytes(b"/opt/\xff/lib:/tmp/.mount_DSH/usr/lib"))
+                ),
+                Some(OsString::from_vec(b"/opt/\xff/lib".to_vec())),
+            );
+        }
+    }
 
     #[tokio::test]
     async fn operation_window_never_falls_back_to_another_profile() {

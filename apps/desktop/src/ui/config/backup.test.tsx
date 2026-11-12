@@ -8,7 +8,8 @@ import { ConfigBackup } from './backup'
 
 const mocks = vi.hoisted(() => ({ invoke: vi.fn(), dialog: vi.fn(), toast: vi.fn() }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke }))
-vi.mock('@overlastic/react', () => ({ useOverlay: () => [null, mocks.dialog] }))
+vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async () => () => {}) }))
+vi.mock('@overlastic/react', () => ({ useOverlay: () => mocks.dialog }))
 vi.mock('@/store', () => ({ store: { harness: { restart: vi.fn() } } }))
 vi.mock('@/utils/toast', () => ({ toast: mocks.toast }))
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }))
@@ -36,7 +37,7 @@ afterEach(() => {
 })
 
 async function mount() {
-  render(<QueryClientProvider client={client}><ConfigBackup onBack={() => {}} /></QueryClientProvider>)
+  render(<QueryClientProvider client={client}><ConfigBackup profileId="profile-a" active onBack={() => {}} /></QueryClientProvider>)
   await screen.findByText('backup.empty_title')
 }
 

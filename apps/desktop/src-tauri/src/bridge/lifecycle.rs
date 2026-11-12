@@ -23,6 +23,19 @@ fn active_dsh_version(app_handle: &AppHandle) -> Option<String> {
     core::active_version(app_handle).or_else(|| config::get_dsh_version(app_handle))
 }
 
+/// 托管安装目录里实际落盘的核心版本。
+///
+/// 自动更新替换的是这个目录，而不是当前选中的核心：本地核心生效时
+/// `active_dsh_version` 给出的是用户自己包管理器那份，拿它判断「是否高于最新稳定版」
+/// 会把托管目录里更高的版本（用户手动下载的预览版）覆盖成更旧的稳定版。
+fn installed_dsh_version(app_handle: &AppHandle) -> Option<String> {
+    core::app_core_version(
+        &config::get_dsh_install_path(app_handle),
+        config::get_dsh_pkg_tag(app_handle).as_deref(),
+    )
+    .or_else(|| config::get_dsh_version(app_handle))
+}
+
 /// 比较两个版本的先后（`candidate` 相对 `baseline`）。
 ///
 /// 两者都须能解析为语义化版本，否则返回 None——无从比较就不下结论，各调用点
@@ -95,7 +108,6 @@ pub async fn install_dependencies(
 
     // 以实际安装状态为准：本地安装与 GitHub 最新 release 的 commit hash
     // 不一致时，说明上游 pkg 有更新/修复，需要自动重新下载。
-    let node_ok = download::Nodejs.check_installed(&app_handle);
     let dsh_files_ok = download::Dsh.check_installed(&app_handle);
     // pnpm 是 dsh plugin 子命令的运行时依赖（v0.3.0 起随环境安装）；老版本
     // 升级后 `installed` 已为 true 会跳过环境安装，捆绑 pnpm 可能从未落盘，
@@ -116,7 +128,7 @@ pub async fn install_dependencies(
     // 误判为真更新，而重下整目录在 Windows 上极易破坏 node_modules（历史 issue：
     // 重解压后启动报找不到 @deepseek-ai/dsh-client-ui-settings）。真更新一律由
     // 启动后的 check_dsh_update 提示用户手动安装，启动路径不该自行下载。
-    if node_ok && dsh_files_ok && pnpm_ok && git_ok {
+    if dsh_files_ok && pnpm_ok && git_ok {
         let setting = config::get_store_dat_setting(&app_handle);
         if !setting.installed {
             log::info!(
@@ -133,7 +145,7 @@ pub async fn install_dependencies(
     // 老版本升级后 installed 仍为 true，但可能缺少新版新增的 Windows Git 依赖。
     // 其余三项均就绪时直接走本地任务跳过 + Git 补装，不查询 Harness 最新版本，
     // 避免一次依赖自愈意外触发核心更新。
-    if node_ok && dsh_files_ok && pnpm_ok && !git_ok {
+    if dsh_files_ok && pnpm_ok && !git_ok {
         log::info!("Git dependency missing, provisioning bundled MinGit without core update check");
         workflow::status::set_status(workflow::status::Status::Installing);
         workflow::status::emit_status(&app_handle);
@@ -146,28 +158,30 @@ pub async fn install_dependencies(
         return Ok(false);
     }
 
-    // 安装目标遵循应用资源中的推荐版本，而不是 GitHub 的 latest。
-    // latest 可能是 alpha/beta 等超出推荐范围的预览版；并且 `/releases/latest`
-    // 不保证与推荐版本的摘要属于同一 release。按推荐 SemVer 反查固定 tag，后续
-    // 资产 URL 与 digest 都从该 tag 获取。
-    let recommended_version = config::recommended_dsh_version(&app_handle);
+    // 安装目标一律跟随 pkg 仓库的最新稳定发行版（推荐版本策略已废弃）。
+    // `fetch_latest_dsh_pkg_info` 内部已排除预览版（Pre-release label 或 tag 命名），
+    // 并保证资产 URL 与摘要来自同一个 tag。
     let installed_version = dsh_files_ok
-        .then(|| active_dsh_version(&app_handle))
+        .then(|| installed_dsh_version(&app_handle))
         .flatten();
+    let dsh_latest = download::fetch_latest_dsh_pkg_info(&app_handle).await;
+    // 已装核心高于最新稳定版（用户主动装了预览版/更高版本）时保持本地安装：
+    // 自动流程不做降级，用户想要更低的版本请自己到核心面板切换。
+    let latest_version = dsh_latest
+        .as_ref()
+        .ok()
+        .and_then(|latest| download::parse_version_from_tag(&latest.tag));
     let preserve_installed =
-        version_order(installed_version.as_deref(), recommended_version.as_deref())
+        version_order(installed_version.as_deref(), latest_version.as_deref())
             == Some(std::cmp::Ordering::Greater);
     let dsh_latest = if preserve_installed {
         log::info!(
-            "Keeping installed dsh version above recommendation: {}",
+            "Keeping installed dsh version above the latest stable release: {}",
             installed_version.as_deref().unwrap_or_default()
         );
         None
     } else {
-        Some(match recommended_version {
-            Some(version) => download::fetch_dsh_pkg_version(&app_handle, &version).await,
-            None => download::fetch_latest_dsh_pkg_info(&app_handle).await,
-        })
+        Some(dsh_latest)
     };
 
     // 已安装文件在盘时，用 resolve_update 甄别「记录滞后」与「真更新」：
@@ -244,7 +258,7 @@ pub async fn install_dependencies(
         }
     };
 
-    if node_ok && !dsh_need_install && pnpm_ok && git_ok {
+    if !dsh_need_install && pnpm_ok && git_ok {
         log::info!("Dependencies already installed and up to date, skipping installation");
         let mut setting = config::get_store_dat_setting(&app_handle);
         if !setting.installed {
@@ -259,9 +273,8 @@ pub async fn install_dependencies(
     workflow::status::set_status(workflow::status::Status::Installing);
     workflow::status::emit_status(&app_handle);
     // 返回 dsh 是否真正落盘更新：仅重装 Node/pnpm 或全部任务被跳过（例如
-    // 版本相同仅记录滞后）时为 false，前端据此决定是否重启页面/保留更新提示
-    // 高于推荐版本的核心没有 release 元数据，因此仅补装 Node/pnpm 时不会被
-    // workflow 当作过期并下载较旧核心。
+    // 版本相同仅记录滞后）时为 false，前端据此决定是否重启页面/保留更新提示。
+    // 已装核心高于最新稳定版时上面已把安装目标清空，workflow 不会把它当过期降级。
     let install_target = dsh_latest.and_then(Result::ok);
     let updated = match workflow::install(&app_handle, install_target).await {
         Ok(updated) => updated,
@@ -314,34 +327,20 @@ pub async fn check_dsh_update(
 
     let latest = download::fetch_latest_dsh_pkg_info(&app_handle).await?;
 
-    // 关键修复1：最新 release 的版本号已经在已装核心列表里（含 active 和非 active
+    // 最新 release 的版本号已经在已装核心列表里（含 active 和非 active
     // 槽位），就不提示更新。避免「老版本激活 + 新版已下载但未切换」场景下白点一次
     // 「立即更新」做整包重下——版本号（用户视角的版本）已经在那了，没必要再拉一遍。
-    if let Some(version) = download::parse_version_from_tag(&latest.tag) {
-        if core::has_installed_version(&app_handle, &version).await {
-            log::info!(
-                "Suppressing dsh update toast because latest version is already installed: {}",
-                version
-            );
-            return Ok(None);
-        }
+    if let Some(version) = download::parse_version_from_tag(&latest.tag)
+        && core::has_installed_version(&app_handle, &version).await
+    {
+        log::info!(
+            "Suppressing dsh update toast because latest version is already installed: {}",
+            version
+        );
+        return Ok(None);
     }
 
-    // 关键修复2：最新 release 高于推荐版本时（通常是 alpha/beta/preview 序号
-    // 大于稳定 RC）不自动推。stable 用户不该被打扰去装 alpha 测试版；用户想追
-    // preview 自行去核心面板下载。这条规则先于「installed 比 latest 低」检查，
-    // 否则装了 0.1.1-rc.1 的用户会被弹 0.1.3-alpha.1 更新。
-    if let Some(version) = download::parse_version_from_tag(&latest.tag) {
-        if config::is_dsh_version_above_recommended(&app_handle, &version) {
-            log::info!(
-                "Suppressing dsh update toast because latest is above recommended (preview/alpha): {}",
-                version
-            );
-            return Ok(None);
-        }
-    }
-
-    // 关键修复3：latest 不高于当前运行核心时不提示。pkg 仓库的「Current latest」
+    // latest 不高于当前运行核心时不提示。pkg 仓库的「Current latest」
     // 可能被指向更旧的 release（dsh-0.1.7-rc.2），而用户运行的核心已是更高的
     // 0.2.0-rc.1；此时提示会把用户引向降级，且「立即更新」也会因保留更高版本
     // 而实际什么都没做，最终只弹一个「更新校验失败」。
@@ -401,68 +400,10 @@ pub async fn restart_harness(
     .await
 }
 
-/// 进入安全模式：确保安全档案存在并切换为当前档案（不重启，由前端走标准重启链路）。
-///
-/// 安全模式只是本次运行的临时档案：不写入 store 的 `active_profile`，退出应用后
-/// 下次启动回到用户原本的档案，不会把「安全模式」带进下一次运行。
-///
-/// 错误界面「安全模式」按钮的入口：安全档案只含 web 模板核心 bundles、不带
-/// 用户插件/补丁层，启动失败的插件（如 pending waiting for service）被隔离，
-/// 应用先恢复可用；用户在档案列表切回原档案即退出安全模式。
-///
-/// 档案目录一旦存在就绝不重建，因此里面可能残留此前被装进去的用户插件（内置插件
-/// 自愈与首次引导安装都作用于「当时的活动档案」）；这些插件由启动前的清除流程卸载
-/// （见 `service::plugin::safe::purge_user_plugins_in_safe_profile`），本命令只负责
-/// 切档案——服务仍在运行时删除插件目录不安全，必须等重启后的 spawn 之前再清。
-///
-/// 补丁层是这里唯一的例外：**home 层（`$DSH_HOME/cordis.patch.yml`）作用于所有
-/// 档案**，安全档案也不例外，因此一处手写笔误（典型是 `!!js` 表达式含 `: ` 却没加
-/// 引号）会让安全模式也起不来，把兜底入口一起废掉（issue #525）。这里在切档案前把
-/// 解析不了的补丁文件改名为同名 `.broken-<时间戳>` 备份（只改名、不删除），保证
-/// 「安全模式一定起得来」；记录回传前端提示备份路径，用户修好语法后改回原名即可恢复。
-///
-/// 改名失败（权限/占用）时**不切换档案层**并返回错误：损坏文件还在原地，重启只会
-/// 再次解析失败，切过去等于把「安全模式」也变成失败循环。此时让用户先处理文件，
-/// 而不是假装已恢复。
-#[tauri::command]
-pub async fn enter_safe_mode(
-    window: crate::Window,
-    app_handle: AppHandle,
-) -> Result<crate::service::plugin::PatchQuarantineReport, String> {
-    let _transition = crate::service::workflow::acquire_core_transition().await?;
-    let profile = crate::service::workflow::instances::window_profile(&app_handle, window.label());
-    crate::service::workflow::instances::scope(profile, async move {
-        crate::service::profile::ensure_safe_profile(&app_handle)?;
-        let report = crate::service::plugin::quarantine_patch_layers_in(
-            &crate::service::profile::profile_dir_of(
-                &app_handle,
-                crate::service::profile::SAFE_PROFILE,
-            ),
-            &config::get_dsh_data_path(&app_handle),
-        );
-        if report.has_failures() {
-            return Err(crate::service::plugin::quarantine_failure_message(&report));
-        }
-        let old = crate::service::profile::active_profile(&app_handle);
-        crate::service::workflow::instances::set_safe_mode(true);
-        crate::service::workflow::instances::bind_window(
-            window.label(),
-            crate::service::profile::SAFE_PROFILE,
-        );
-        if !crate::service::workflow::instances::is_attached(&old) {
-            workflow::stop(app_handle.clone()).await?;
-        }
-        Ok(report)
-    })
-    .await
-}
-
 /// 隔离解析失败的补丁层：当前档案层 + home 层（错误页「隔离损坏的补丁文件」入口）。
 ///
-/// 与 [`enter_safe_mode`] 共用同一套隔离逻辑，区别只在作用范围——本命令让用户留在
-/// 自己的档案里恢复，不切档案、不动插件。补丁文件只改名保存，内容原样保留。
-///
-/// 与 [`enter_safe_mode`] 同样：只要有损坏层没能移走就返回错误，前端不重启——否则
+/// 补丁文件只改名保存（`.broken-<时间戳>`），内容原样保留，用户修好语法后改回原名
+/// 即可恢复；不切档案、不动插件。只要有损坏层没能移走就返回错误，前端不重启——否则
 /// 会立刻回到同一个解析失败。
 #[tauri::command]
 pub async fn quarantine_broken_patch_layers(
@@ -520,8 +461,7 @@ pub fn get_dsh_status(
 /// 补记 installed 后直接启动，避免自动重开时闪现误导用户的安装界面。
 #[tauri::command]
 pub fn runtime_ready(app_handle: AppHandle) -> bool {
-    download::Nodejs.check_installed(&app_handle)
-        && download::Dsh.check_installed(&app_handle)
+    download::Dsh.check_installed(&app_handle)
         && download::Pnpm.check_installed(&app_handle)
         && config::git_runtime_ready(&app_handle)
 }
@@ -571,9 +511,9 @@ mod tests {
     }
 
     #[test]
-    fn newer_installed_dsh_is_preserved_from_recommended_downgrade() {
-        let preserve = |installed: &str, recommended: &str| {
-            version_order(Some(installed), Some(recommended)) == Some(Ordering::Greater)
+    fn newer_installed_dsh_is_preserved_from_stable_downgrade() {
+        let preserve = |installed: &str, latest: &str| {
+            version_order(Some(installed), Some(latest)) == Some(Ordering::Greater)
         };
         assert!(preserve("0.1.1-rc.3", "0.1.1-rc.2"));
         assert!(!preserve("0.1.1-rc.2", "0.1.1-rc.2"));

@@ -4,11 +4,11 @@
 //! [`active_source`] / [`active_dsh_binary`] / [`active_core_dir`] / [`active_version`]
 //! 四个供服务启动与插件操作统一取用的入口。本地核心探测见 [`super::local`]。
 
+use crate::AppHandle;
 use crate::config;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use crate::AppHandle;
 
 use super::local::{local_core, local_core_package_dir};
 use crate::service::download::parse_version_from_tag;
@@ -67,60 +67,71 @@ pub struct HarnessCore {
     /// `download::is_preview_tag`）：预览版不参与自动更新提示，但可在核心列表
     /// 手动下载安装，并以「预览版」标签展示。
     pub preview: bool,
-    /// 当前版本是否高于资源清单中的推荐版本。
-    pub above_recommended: bool,
     /// 本地存在但远程 pkg 仓库已不再提供的历史槽位。
     pub orphaned: bool,
     /// 是否随安装包分发（离线包把内核托管到 `$Resources/dsh`）：核心面板把它置顶并
     /// 标记「本地」，且不提供卸载——它是内网/离线环境唯一的兜底内核。
     pub bundled: bool,
-    /// 资源清单中的推荐版本，用于切换前风险提示。
-    pub recommended_version: Option<String>,
     pub error: Option<String>,
 }
 
 /// 基线告警只发一次：`active_source` 在启动、核心列表与插件操作中反复调用。
 static UNSUPPORTED_LOCAL_WARNED: OnceLock<()> = OnceLock::new();
 
-/// 版本是否达到最低支持基线（来自 `resources/manifest.jsonc` 的 `engines.dsh.minimum`）；
-/// 基线缺失或任一版本无法解析时按「达标」处理。
-fn meets_baseline(version: &str, baseline: &str) -> bool {
-    match (
-        semver::Version::parse(version),
-        semver::Version::parse(baseline),
-    ) {
-        (Ok(actual), Ok(baseline)) => actual >= baseline,
-        _ => true,
-    }
+pub(crate) fn core_supports_bundled_plugins(version: &str, baseline: Option<&str>) -> bool {
+    let Ok(actual) = semver::Version::parse(version) else {
+        return false;
+    };
+    actual.major == 0
+        && actual.minor == 2
+        && actual.patch == 2
+        && semver::Version::parse("0.2.2-rc.1").is_ok_and(|minimum| actual >= minimum)
+        && baseline
+            .and_then(|baseline| semver::Version::parse(baseline).ok())
+            .is_none_or(|baseline| actual >= baseline)
 }
 
-/// 本地核心能否承载随包内置插件（基线取自清单 `engines.dsh.minimum`）。
+/// 预打包核心目录里**实际安装**的引擎版本（不含 `v` 前缀）。
 ///
-/// 最低支持版本由随包清单声明；清单缺失（基线与版本都读不到）时不阻断，宁可放行
-/// 也不把可用的本地核心判死——清单损坏的诊断由 `manifest` 模块记录。
-pub(super) fn core_supports_bundled_plugins(version: &str, baseline: Option<&str>) -> bool {
-    match baseline {
-        Some(baseline) => meets_baseline(version, baseline),
-        None => true,
-    }
+/// 先读磁盘清单，再回落到安装记录的 tag：tag 只说明「上次下载了哪个发布」，
+/// 磁盘上那份文件才是真正会被启动的（issue #1374）。
+pub(crate) fn app_core_version(core_dir: &std::path::Path, tag: Option<&str>) -> Option<String> {
+    config::dsh_version_at(&config::manifest_in(core_dir))
+        .filter(|version| semver::Version::parse(version).is_ok())
+        .or_else(|| tag.and_then(parse_version_from_tag))
 }
 
+/// 托管核心是否可启动：只按盘上那份文件的清单判版本，归档与目录两种形态一视同仁
+/// （入口存在性由启动链路的 core_entry_exists 兜底，两处判定不重复）。
 pub(crate) fn ensure_app_core_supported(
     core_dir: &std::path::Path,
     tag: Option<&str>,
     baseline: Option<&str>,
 ) -> Result<(), String> {
-    let version = config::dsh_version_at(&core_dir.join(config::DSH_MANIFEST_RELATIVE))
-        .filter(|version| semver::Version::parse(version).is_ok())
-        .or_else(|| tag.and_then(parse_version_from_tag));
+    let version = app_core_version(core_dir, tag);
     if !core_supports_bundled_plugins(version.as_deref().unwrap_or_default(), baseline) {
         return Err(format!(
-            "CORE_APP_UNSUPPORTED: app dsh {} is below the minimum supported core {}; download and select a newer core in Settings > Core, or update the desktop app for a newer bundled core",
+            "CORE_APP_UNSUPPORTED: app dsh {} is outside the supported 0.2.2 core series (minimum {}); {}",
             version.as_deref().unwrap_or_default(),
             baseline.unwrap_or_default(),
+            repair_hint(core_dir, version.as_deref(), baseline),
         ));
     }
     Ok(())
+}
+
+/// 低于基线时的可操作提示：点名磁盘路径与两个版本，而不是让人猜「重试」为什么无效。
+fn repair_hint(
+    core_dir: &std::path::Path,
+    version: Option<&str>,
+    baseline: Option<&str>,
+) -> String {
+    format!(
+        "the core installed at {} is {} but this app requires at least {}; restart the app to reinstall it automatically, or delete that directory and restart, or download a newer core in Settings > Core",
+        core_dir.display(),
+        version.unwrap_or("<unknown>"),
+        baseline.unwrap_or("<unset>"),
+    )
 }
 
 fn warn_unsupported_local_core(version: &str, baseline: Option<&str>) {
@@ -128,7 +139,7 @@ fn warn_unsupported_local_core(version: &str, baseline: Option<&str>) {
         return;
     }
     log::warn!(
-        "CORE_LOCAL_UNSUPPORTED: local dsh {} is below the minimum supported core {}; using the bundled core instead (issue #596)",
+        "CORE_LOCAL_UNSUPPORTED: local dsh {} is outside the supported 0.2.2 core series (minimum {}); using the bundled core instead (issue #596)",
         version,
         baseline.unwrap_or("<unset>"),
     );
@@ -174,7 +185,7 @@ pub fn active_source<R: tauri::Runtime>(app_handle: &AppHandle<R>) -> CoreSource
 ///
 /// 供服务启动（workflow::launch）与插件操作（plugin::install 等）统一取用，
 /// 本地核心解析在调用瞬间失效时回退预打包入口。
-pub fn active_dsh_binary(app_handle: &AppHandle) -> PathBuf {
+pub fn active_dsh_binary<R: tauri::Runtime>(app_handle: &AppHandle<R>) -> PathBuf {
     match active_source(app_handle) {
         CoreSource::Local => local_core(app_handle)
             .map(|c| c.bin)
@@ -203,7 +214,7 @@ pub fn active_core_dir(app_handle: &AppHandle) -> PathBuf {
 ///
 /// 判定「来源是 App **且** 生效根就是随包内核目录」：切到本地核心时映射被记为系统环境、
 /// 生效根回落到随包目录，此时不能再算作随包内核。
-pub fn active_is_bundled(app_handle: &AppHandle) -> bool {
+pub fn active_is_bundled<R: tauri::Runtime>(app_handle: &AppHandle<R>) -> bool {
     active_source(app_handle) == CoreSource::App
         && config::dependencies::bundled_core_dir(app_handle).is_some_and(|dir| {
             config::dependencies::active_root(app_handle, config::dependencies::DEP_DSH) == dir
@@ -220,12 +231,32 @@ pub fn active_version(app_handle: &AppHandle) -> Option<String> {
             if active_is_bundled(app_handle) {
                 return config::get_dsh_version(app_handle);
             }
-            config::get_dsh_pkg_tag(app_handle)
-                .as_deref()
-                .and_then(parse_version_from_tag)
-                .or_else(|| config::get_dsh_version(app_handle))
+            // 磁盘上的实际文件优先：store 里的 tag 只记录「上次下载的是哪个发布」，
+            // 应用自动更新后它与目录里的旧文件可能不一致（issue #1374 的「自报版本与
+            // 实际校验版本不一致」）。
+            app_core_version(
+                &config::get_dsh_install_path(app_handle),
+                config::get_dsh_pkg_tag(app_handle).as_deref(),
+            )
+            .or_else(|| config::get_dsh_version(app_handle))
         }
     }
+}
+
+pub fn app_core_meets_baseline(app_handle: &AppHandle) -> bool {
+    if active_source(app_handle) != CoreSource::App {
+        return true;
+    }
+    let baseline = config::manifest::minimum_dsh_version(app_handle);
+    core_supports_bundled_plugins(
+        app_core_version(
+            &config::get_dsh_install_path(app_handle),
+            config::get_dsh_pkg_tag(app_handle).as_deref(),
+        )
+        .as_deref()
+        .unwrap_or_default(),
+        baseline.as_deref(),
+    )
 }
 
 #[cfg(test)]
@@ -233,107 +264,71 @@ mod tests {
     use super::*;
 
     #[test]
-    fn app_core_baseline_checks_disk_and_tag_without_blocking_unknown_versions() {
+    fn supported_core_series_starts_at_022_rc1() {
+        for version in ["0.2.2-rc.1", "0.2.2-rc.2", "0.2.2", "0.2.2+build.1"] {
+            assert!(core_supports_bundled_plugins(version, None), "{version}");
+        }
+        for version in [
+            "",
+            "unknown",
+            "0.2.1",
+            "0.2.2-beta.1",
+            "0.2.2-rc.0",
+            "0.2.3-rc.1",
+            "0.3.0",
+            "1.0.0",
+        ] {
+            assert!(!core_supports_bundled_plugins(version, None), "{version}");
+        }
+        assert!(!core_supports_bundled_plugins(
+            "0.2.2-rc.1",
+            Some("0.2.2-rc.2")
+        ));
+    }
+
+    #[test]
+    fn directory_core_with_a_supported_version_is_accepted() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(config::DSH_MANIFEST_RELATIVE),
+            r#"{"name":"@deepseek-ai/dsh","version":"0.2.2-rc.1"}"#,
+        )
+        .unwrap();
+        let package = root.path().join("node_modules/@deepseek-ai/dsh");
+        std::fs::create_dir_all(package.join("lib")).unwrap();
+        std::fs::write(package.join("lib/bin.js"), "directory core").unwrap();
+
+        assert!(ensure_app_core_supported(root.path(), None, None).is_ok());
+
+        std::fs::write(
+            root.path().join(config::DSH_MANIFEST_RELATIVE),
+            r#"{"name":"@deepseek-ai/dsh","version":"0.1.6"}"#,
+        )
+        .unwrap();
+        assert!(
+            ensure_app_core_supported(root.path(), None, None)
+                .unwrap_err()
+                .starts_with("CORE_APP_UNSUPPORTED:")
+        );
+    }
+
+    #[test]
+    fn app_core_version_prefers_disk_over_the_recorded_tag() {
         let root = tempfile::tempdir().unwrap();
         let manifest = root.path().join(config::DSH_MANIFEST_RELATIVE);
-        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
-        let baseline = Some("0.2.1-rc.1");
-        assert!(ensure_app_core_supported(root.path(), None, baseline).is_ok());
-        assert!(ensure_app_core_supported(root.path(), Some("dsh-0.2.0-123"), baseline).is_err());
-        for package in [
-            serde_json::json!({"dependencies": {"@deepseek-ai/dsh": "^0.2.0"}}),
-            serde_json::json!({"name": "@deepseek-ai/dsh", "version": "0.2.0"}),
-        ] {
-            std::fs::write(&manifest, package.to_string()).unwrap();
-            let error = ensure_app_core_supported(
-                root.path(), Some("dsh-0.2.1-rc.1-123"), baseline,
-            ).unwrap_err();
-            assert!(error.starts_with("CORE_APP_UNSUPPORTED:"));
-            assert!(error.contains("0.2.0"));
-            assert!(error.contains("0.2.1-rc.1"));
-            assert!(error.contains("download and select a newer core"));
-            assert!(ensure_app_core_supported(root.path(), None, None).is_ok());
-        }
-        for version in ["0.2.1-rc.1", "0.2.1", "unknown", ""] {
-            std::fs::write(&manifest, serde_json::json!({
-                "name": "@deepseek-ai/dsh", "version": version,
-            }).to_string()).unwrap();
-            assert!(ensure_app_core_supported(root.path(), None, baseline).is_ok());
-        }
-        for version in [">=0.2.1-rc.1 <0.2.1", "unknown", ""] {
-            std::fs::write(&manifest, serde_json::json!({
-                "dependencies": {"@deepseek-ai/dsh": version},
-            }).to_string()).unwrap();
-            assert!(ensure_app_core_supported(root.path(), Some("dsh-0.2.0-123"), baseline).is_err());
-            assert!(ensure_app_core_supported(root.path(), Some("dsh-0.2.1-rc.5-123"), baseline).is_ok());
-        }
-        let installed = root.path().join("node_modules/@deepseek-ai/dsh/package.json");
-        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
-        for (declared, actual, supported) in [
-            ("0.2.1-rc.5", "0.2.0", false),
-            ("0.2.0", "0.2.1-rc.5", true),
-            ("0.2.1-rc.5", "0.2.1-rc.1", true),
-            ("0.2.1-rc.5", "unknown", true),
-        ] {
-            std::fs::write(&manifest, serde_json::json!({
-                "dependencies": {"@deepseek-ai/dsh": declared},
-            }).to_string()).unwrap();
-            std::fs::write(&installed, serde_json::json!({
-                "name": "@deepseek-ai/dsh", "version": actual,
-            }).to_string()).unwrap();
-            assert_eq!(ensure_app_core_supported(root.path(), None, baseline).is_ok(), supported,
-                "declared={declared}, actual={actual}");
-        }
-        std::fs::remove_file(&manifest).unwrap();
-        std::fs::write(&installed, r#"{"name":"@deepseek-ai/dsh","version":"0.2.0"}"#).unwrap();
-        assert!(ensure_app_core_supported(root.path(), None, baseline).is_err());
-        std::fs::write(&manifest, r#"{"name":"@deepseek-ai/dsh","version":"0.2.1-rc.5"}"#).unwrap();
-        assert!(ensure_app_core_supported(root.path(), None, baseline).is_ok());
-    }
-
-    #[test]
-    fn core_source_round_trips() {
-        assert_eq!(CoreSource::parse("local"), Some(CoreSource::Local));
-        assert_eq!(CoreSource::parse("app"), Some(CoreSource::App));
-        assert_eq!(CoreSource::parse("other"), None);
-        assert_eq!(CoreSource::Local.as_str(), "local");
-        assert_eq!(CoreSource::App.as_str(), "app");
-    }
-
-    #[test]
-    fn baseline_gate_accepts_equal_or_newer_versions() {
-        let baseline = "0.2.1-rc.1";
-        for version in ["0.2.1-rc.1", "0.2.1-rc.2", "0.2.1", "0.3.0"] {
-            assert!(meets_baseline(version, baseline), "version={version}");
-        }
-    }
-
-    #[test]
-    fn baseline_gate_rejects_older_versions() {
-        let baseline = "0.2.1-rc.1";
-        for version in [
-            "0.1.0-rc.7",
-            "0.1.7-rc.1",
-            "0.2.0-alpha.2",
-            "0.2.0",
-            "0.2.1-alpha.1",
-            "0.2.1-beta.1",
-            "0.2.1-rc.0",
-        ] {
-            assert!(!meets_baseline(version, baseline), "version={version}");
-        }
-    }
-
-    #[test]
-    fn baseline_gate_passes_unparsable_versions() {
-        assert!(meets_baseline("", "0.2.1-rc.1"));
-        assert!(meets_baseline("not-a-version", "0.2.1-rc.1"));
-        assert!(meets_baseline("0.2.1-rc.1", ""));
-    }
-
-    #[test]
-    fn missing_baseline_keeps_local_core_usable() {
-        assert!(core_supports_bundled_plugins("0.1.6", None));
-        assert!(!core_supports_bundled_plugins("0.2.0", Some("0.2.1-rc.1")));
+        std::fs::write(
+            &manifest,
+            r#"{"name":"@deepseek-ai/dsh","version":"0.2.2-rc.1"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            app_core_version(root.path(), Some("dsh-0.2.2-rc.2-123")).as_deref(),
+            Some("0.2.2-rc.1")
+        );
+        std::fs::remove_file(manifest).unwrap();
+        assert_eq!(
+            app_core_version(root.path(), Some("dsh-0.2.2-rc.2-123")).as_deref(),
+            Some("0.2.2-rc.2")
+        );
     }
 }

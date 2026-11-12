@@ -1,17 +1,14 @@
 use std::time::Duration;
 
-/// 捆绑的 Node.js 运行时版本（满足当前 DSH 的 v22.19.0+ 或 v24+ 要求）
-pub const NODE_VERSION: &str = "v22.22.0";
-
-/// Node.js 官方下载地址
-pub const NODE_BASE_URL: &str = "https://nodejs.org/dist/";
-
-/// Node.js 镜像下载地址（npmmirror，302 重定向至 cdn.npmmirror.com）
-pub const NODE_MIRROR_BASE_URL: &str = "https://npmmirror.com/mirrors/node/";
+/// 旧版独立 Node 运行时的托管目录名（`$AppData/runtime`）。
+///
+/// 仅用于启动时清理历史安装：dsh 与 pnpm 现在一律以随包 Electron 的 Node 模式
+/// 运行，不再下载、安装或解析独立 Node。
+pub const LEGACY_NODE_ROOT_DIR: &str = "runtime";
 
 /// 打包的 DeepSeek Harness 发行版下载地址（GitHub Release，默认首选源）
 pub const DSH_CORE_URL: &str =
-    "https://github.com/dsh-tauri-desk/deepseek-harness-pkg/releases/latest/download/";
+    "https://github.com/dsh-tauri/deepseek-harness-pkg/releases/latest/download/";
 
 /// GitHub Release 的代理镜像前缀列表（透传官方 URL，下载内容一致、
 /// 仍可做 SHA-256 完整性校验），按实测延迟从低到高排列，官方直连失败时依次兜底。
@@ -108,29 +105,14 @@ pub const E2E_PORT_ENV_VAR: &str = "TAURI_WEBDRIVER_PORT";
 pub const DOWNLOAD_CACHE_ENV_VAR: &str = "DSH_DOWNLOAD_CACHE_DIR";
 
 pub const STORE_SETTING_KEY: &str = "setting";
-/// Store 中记录主窗口几何（位置/大小/最大化）的键
+/// Store 中曾经记录主窗口几何（位置/大小/最大化）的键。
+///
+/// 几何已改由 tauri-plugin-window-state 保存（issue #1383），此键仅用于一次性迁移历史记录。
 pub const STORE_WINDOW_STATE_KEY: &str = "window_state";
-/// Store 中记录桌宠（外置透明宠物窗口）几何（位置/大小）的键
-pub const STORE_PET_WINDOW_STATE_KEY: &str = "pet_window_state";
 /// Store 中记录「已下载、等待安装」的桌面端安装包路径的键。
 /// 刻意独立于 `setting` 键：`Setting` 会被前端整对象写回，该运行期标记
 /// 必须由 Rust 精确读写（见 service::update::pending）。
 pub const STORE_PENDING_INSTALLER_KEY: &str = "desktop_pending_installer";
-
-/// 健康检查的整体请求截止时间（reqwest `.timeout()`：从开始建连到响应体读完）。
-pub const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// 回环探测的建连超时。
-///
-/// 装了 TUN 式网络过滤器（Clash/Mihomo TUN、Fake-IP 等）的机器上，**失败**的回环
-/// `connect` 会固定阻塞约 2s（实测 2014–2067ms，`curl`/`.NET`/裸 winsock 一致）。
-/// 2s 落在整体截止时间（[`HEALTH_CHECK_TIMEOUT`]）的余量内，失败照旧发生在建连阶段，
-/// 端口尚未监听的每一轮健康检查因此都要白等 2s；回环建连本身在微秒级完成，只对建连
-/// 单独限时即可把这段等待压到百毫秒级。
-pub const LOOPBACK_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
-
-/// spawn → 客户端模块就绪超过该阈值时，日志给出 `STARTUP_SLOW` 归因（正常机器实测 5–8s）。
-pub const SLOW_STARTUP_THRESHOLD: Duration = Duration::from_secs(15);
 
 /// 代理连通性测试的探测目标：更新检查实际依赖的 GitHub 发布源。
 ///

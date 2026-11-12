@@ -19,7 +19,7 @@ const { manager, openDialog, mocks, hmrStatus } = vi.hoisted(() => ({
 }))
 
 vi.mock('@/hooks/use-plugins-manager', () => ({ useDshPluginsManager: () => manager }))
-vi.mock('@overlastic/react', () => ({ useOverlay: () => [null, openDialog] }))
+vi.mock('@overlastic/react', () => ({ useOverlay: () => openDialog }))
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }))
 // useMutation 桩会真正执行传入的 mutationFn：命令名与参数由用例断言，而不是断言「调用了 mutate」。
 vi.mock('@tanstack/react-query', () => ({
@@ -76,8 +76,8 @@ vi.mock('@heroui/react', () => ({
 
 function plugin(overrides: Partial<Plugin> = {}): Plugin {
   return {
-    id: 'dsh-tauri-pet',
-    name: 'Desktop Pet',
+    id: 'dsh-tauri-archive',
+    name: 'DSH Tauri Archive',
     internal: true,
     disabled: false,
     version: '1.0.0',
@@ -144,7 +144,7 @@ describe('built-in plugin toggles', () => {
     }))
     expect(manager.disable).not.toHaveBeenCalled()
     await act(async () => confirm())
-    expect(manager.disable).toHaveBeenCalledExactlyOnceWith('dsh-tauri-pet')
+    expect(manager.disable).toHaveBeenCalledExactlyOnceWith('dsh-tauri-archive')
   })
 
   it('does not disable when the risk dialog is cancelled', async () => {
@@ -160,7 +160,7 @@ describe('built-in plugin toggles', () => {
     showBuiltIn()
     expect(screen.queryByRole('button', { name: 'plugins.disable' })).toBeNull()
     await act(async () => fireEvent.click(screen.getByRole('button', { name: 'plugins.enable' })))
-    expect(manager.enable).toHaveBeenCalledExactlyOnceWith('dsh-tauri-pet')
+    expect(manager.enable).toHaveBeenCalledExactlyOnceWith('dsh-tauri-archive')
     expect(openDialog).not.toHaveBeenCalled()
   })
 
@@ -168,7 +168,7 @@ describe('built-in plugin toggles', () => {
     manager.installed = [plugin({ internal: false })]
     render(<ConfigPlugin />)
     await act(async () => fireEvent.click(screen.getByRole('button', { name: 'plugins.disable' })))
-    expect(manager.disable).toHaveBeenCalledExactlyOnceWith('dsh-tauri-pet')
+    expect(manager.disable).toHaveBeenCalledExactlyOnceWith('dsh-tauri-archive')
     expect(openDialog).not.toHaveBeenCalled()
   })
 })

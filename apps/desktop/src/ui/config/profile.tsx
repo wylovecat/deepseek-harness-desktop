@@ -1,6 +1,6 @@
 import type { Profile } from '@/types'
 import { CopyArrowRight, Plus } from '@gravity-ui/icons'
-import { AlertDialog, Button, Checkbox, Chip, Description, Input, Label } from '@heroui/react'
+import { AlertDialog, Button, Checkbox, Chip, Description, Input, Label, Switch } from '@heroui/react'
 import { useOverlay } from '@overlastic/react'
 import { useToggle } from '@reause/core'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -107,10 +107,11 @@ export function ConfigProfile() {
   /** 迁移入口的禁用条件：操作进行中、没有当前档案、或没有第二个档案可作来源 */
   const migrateBlocked = busy || !activeProfile || profiles.length < 2
 
-  const [dialogHolder, openDialog] = useOverlay(Modal, { type: 'holder' })
+  const openDialog = useOverlay(Modal)
 
   const { t } = useTranslation()
   const [creating, toggleCreating] = useToggle()
+  const [advanced, toggleAdvanced] = useToggle()
   const [name, setName] = useState('')
   const [activeView, setActiveView] = useState<ProfileView>('list')
 
@@ -119,7 +120,7 @@ export function ConfigProfile() {
   const [cloneName, setCloneName] = useState('')
 
   // 迁移档案数据：来源档案在对话框内选择，目标恒为当前使用中的档案
-  const [migrateDialogHolder, openMigrateDialog] = useOverlay(ProfileMigrateDialog, { type: 'holder' })
+  const openMigrateDialog = useOverlay(ProfileMigrateDialog)
 
   /**
    * 档案名会直接当磁盘目录名与 CLI `--profile` 参数，只能用 ASCII 字母数字（`-`/`_`/空格
@@ -219,6 +220,17 @@ export function ConfigProfile() {
     catch (err) {
       console.error('[ConfigProfile] activate failed:', err)
       toast(t('profiles.activate_failed', { name: target.name }), {})
+    }
+  }
+
+  /** 用该档案另开一个窗口：新窗口自己拉起该档案的服务，当前窗口不受影响 */
+  async function openProfileWindow(profile: { id: string, name: string }) {
+    try {
+      await invoke('create_app_window', { profile: profile.id })
+    }
+    catch (err) {
+      console.error('[ConfigProfile] open window failed:', err)
+      toast(t('profiles.open_window_failed', { name: profile.name }), {})
     }
   }
 
@@ -346,7 +358,7 @@ export function ConfigProfile() {
   // 备份子视图：点击档案的「备份」芯片后进入
   if (activeView !== 'list') {
     return (
-      <ConfigBackup onBack={() => setActiveView('list')} />
+      <ConfigBackup profileId={activeView.profile} active={activeView.profile === activeProfile?.id} onBack={() => setActiveView('list')} />
     )
   }
 
@@ -357,15 +369,31 @@ export function ConfigProfile() {
         description={t('profiles.tooltip')}
         testId="dsh-config-panel-title"
         action={(
-          <Button
-            size="sm"
-            variant="primary"
-            isDisabled={migrateBlocked}
-            onPress={() => void openMigrateDialog()}
-          >
-            <CopyArrowRight className="size-3.5" />
-            {t('profiles.migrate')}
-          </Button>
+          <div className="flex shrink-0 items-center gap-3">
+            <Switch
+              size="sm"
+              isSelected={advanced}
+              onChange={() => toggleAdvanced()}
+              aria-label={t('profiles.advanced_options')}
+            >
+              <Switch.Content className="gap-2">
+                <Switch.Control>
+                  <Switch.Thumb />
+                </Switch.Control>
+                <span className="text-xs font-medium text-muted">{t('profiles.advanced_options')}</span>
+              </Switch.Content>
+            </Switch>
+            <Button
+              data-testid="dsh-profile-migrate-open"
+              size="sm"
+              variant="primary"
+              isDisabled={migrateBlocked}
+              onPress={() => void openMigrateDialog()}
+            >
+              <CopyArrowRight className="size-3.5" />
+              {t('profiles.migrate')}
+            </Button>
+          </div>
         )}
       />
 
@@ -403,27 +431,41 @@ export function ConfigProfile() {
                       </Checkbox.Control>
                     </Checkbox.Content>
                   </Checkbox>
-                  <Chip
-                    size="sm"
-                    onClick={(event) => {
-                      event.stopPropagation()
-                      setActiveView({ profile: profile.id })
-                    }}
-                  >
-                    {t('backup.manage')}
-                  </Chip>
-                  <Chip
-                    className={busy ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'}
-                    color="accent"
-                    size="sm"
-                    onClick={(event) => {
-                      event.stopPropagation()
-                      if (!busy)
-                        openCloneDialog(profile)
-                    }}
-                  >
-                    {t('profiles.clone')}
-                  </Chip>
+                  {/* 单独包一层拦冒泡：行本体是「切换档案」，按钮点击不该顺带切档案 */}
+                  <span onClick={event => event.stopPropagation()}>
+                    <Button
+                      size="sm"
+                      variant="tertiary"
+                      className="h-7"
+                      isDisabled={busy}
+                      onPress={() => void openProfileWindow(profile)}
+                    >
+                      {t('profiles.open_window')}
+                    </Button>
+                  </span>
+                  <If cond={advanced}>
+                    <Chip
+                      size="sm"
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        setActiveView({ profile: profile.id })
+                      }}
+                    >
+                      {t('backup.manage')}
+                    </Chip>
+                    <Chip
+                      className={busy ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'}
+                      color="accent"
+                      size="sm"
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        if (!busy)
+                          openCloneDialog(profile)
+                      }}
+                    >
+                      {t('profiles.clone')}
+                    </Chip>
+                  </If>
                   <Chip
                     className={busy ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'}
                     variant="primary"
@@ -498,8 +540,6 @@ export function ConfigProfile() {
           </If>
         </div>
       </Panel.Loadable>
-      {dialogHolder}
-      {migrateDialogHolder}
 
       {/* 克隆档案：命名对话框（创建型，accent；可编辑建议名称） */}
       <AlertDialog

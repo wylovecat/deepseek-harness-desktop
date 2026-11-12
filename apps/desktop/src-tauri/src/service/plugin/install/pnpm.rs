@@ -138,7 +138,7 @@ async fn user_pnpm_major_version_bounded(
     };
     pnpm_major_version_at_bounded(
         &pnpm,
-        Some(&config::get_node_binary_path(app_handle)),
+        Some(&crate::service::workflow::electron_executable(app_handle)?),
         Some(&cli::get_bin_dir(app_handle)),
         owner,
     )
@@ -294,10 +294,10 @@ fn terminate_probe(
                 "PNPM_PROBE_TREE_CLEANUP_FAILED: pnpm version probe process tree termination was not confirmed",
             ));
         }
-        if let Err(error) = root_killed {
-            if child.try_wait()?.is_none() {
-                return Err(error);
-            }
+        if let Err(error) = root_killed
+            && child.try_wait()?.is_none()
+        {
+            return Err(error);
         }
     }
     Ok(())
@@ -331,10 +331,10 @@ fn monitor_probe_cleanup(
         let killer =
             tauri::async_runtime::spawn_blocking(move || terminate_probe(&child, terminate_tree));
         let wait = async move {
-            if let Some(waiter) = waiter {
-                if let Err(error) = waiter.await {
-                    log::error!("pnpm version probe cleanup wait task failed: {error}");
-                }
+            if let Some(waiter) = waiter
+                && let Err(error) = waiter.await
+            {
+                log::error!("pnpm version probe cleanup wait task failed: {error}");
             }
         };
         let (killed, ()) = tokio::join!(killer, wait);
@@ -629,7 +629,7 @@ pub(crate) async fn harness_prefer_bundled_pnpm(app_handle: &AppHandle) -> Resul
         &config::get_pnpm_install_path(app_handle),
         &config::get_pnpm_binary_path(app_handle),
         cli::find_user_pnpm(app_handle).as_deref(),
-        &config::get_node_binary_path(app_handle),
+        &crate::service::workflow::electron_executable(app_handle)?,
         &cli::get_bin_dir(app_handle),
     )
     .await
@@ -1282,10 +1282,10 @@ mod tests {
         .await;
         let failure = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if let Err(reason) = acquire_process_lock().await {
-                    if reason.starts_with("PNPM_PROBE_TREE_CLEANUP_FAILED:") {
-                        break reason;
-                    }
+                if let Err(reason) = acquire_process_lock().await
+                    && reason.starts_with("PNPM_PROBE_TREE_CLEANUP_FAILED:")
+                {
+                    break reason;
                 }
                 tokio::task::yield_now().await;
             }

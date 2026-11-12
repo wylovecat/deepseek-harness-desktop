@@ -1,18 +1,19 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "DSH Tauri",
-  "version": "0.30.2",
+  "version": "0.31.4",
   "identifier": "dsh-tauri",
   "build": {
-    "beforeDevCommand": "pnpm dev",
-    "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "pnpm -w build:plugins && pnpm build",
     "beforeBundleCommand": "node ../../crates/tauri-runtime-electron/tools/macos-sign/sign.mjs",
     "frontendDist": "../dist"
   },
   "app": {
     "security": {
-      "assetProtocol": { "enable": true, "scope": [] }
+      "assetProtocol": {
+        "enable": true,
+        "scope": []
+      }
     }
   },
   "plugins": {
@@ -61,6 +62,10 @@
           "English",
           "SimpChinese"
         ],
+        "customLanguageFiles": {
+          "English": "templates/languages/English.nsh",
+          "SimpChinese": "templates/languages/SimpChinese.nsh"
+        },
         "displayLanguageSelector": false,
         "installerIcon": "icons/icon.ico",
         "uninstallerIcon": "icons/icon.ico"
@@ -68,12 +73,19 @@
     },
     "linux": {
       "deb": {
+        "depends": [
+          "zenity",
+          "libudev1"
+        ],
         "conflicts": [
           "deepseek-harness-desktop"
         ],
         "replaces": [
           "deepseek-harness-desktop"
-        ]
+        ],
+        "postInstallScript": "templates/linux/postinst.sh",
+        "postRemoveScript": "templates/linux/postrm.sh",
+        "desktopTemplate": "templates/linux/main.desktop"
       }
     }
   }

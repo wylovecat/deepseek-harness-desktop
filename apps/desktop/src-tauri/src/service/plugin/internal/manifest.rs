@@ -7,15 +7,55 @@ use std::os::windows::fs::FileTypeExt;
 use std::path::Path;
 
 pub(crate) fn internal_plugin_entry_is_ready(entry: &Path) -> bool {
-    let Ok(raw) = std::fs::read(entry.join("package.json")) else {
-        return false;
+    internal_plugin_entry_problem(entry).is_none()
+}
+
+/// 内置插件入口不就绪的具体原因（就绪时为 None）。
+///
+/// 判定语义与 internal_plugin_entry_is_ready 完全一致，只是把「哪一步不成立」拆开：
+/// 清单读不出来（io 错误原样带出）、JSON 解析失败、顶层不是对象、声明的 main 不是
+/// 字符串或其产物不在位。启动自愈每轮据此决定是否重装，日志必须能自证是「路径漂移」
+/// 还是「入口不在位」，否则只剩三个布尔值无法定位（issue #1503）。
+pub(super) fn internal_plugin_entry_problem(entry: &Path) -> Option<String> {
+    let manifest_path = entry.join("package.json");
+    let raw = match std::fs::read(&manifest_path) {
+        Ok(raw) => raw,
+        Err(error) => {
+            return Some(format!(
+                "INTERNAL_PLUGIN_ENTRY_MANIFEST_UNREADABLE: {}: {error}",
+                manifest_path.display()
+            ));
+        }
     };
-    serde_json::from_slice::<serde_json::Value>(&raw).is_ok_and(|manifest| {
-        manifest.is_object()
-            && manifest
-                .get("main")
-                .is_none_or(|main| main.as_str().is_some_and(|main| entry.join(main).is_file()))
-    })
+    let manifest = match serde_json::from_slice::<serde_json::Value>(&raw) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return Some(format!(
+                "INTERNAL_PLUGIN_ENTRY_MANIFEST_INVALID: {}: {error}",
+                manifest_path.display()
+            ));
+        }
+    };
+    if !manifest.is_object() {
+        return Some(format!(
+            "INTERNAL_PLUGIN_ENTRY_MANIFEST_NOT_OBJECT: {}",
+            manifest_path.display()
+        ));
+    }
+    match manifest.get("main") {
+        None => None,
+        Some(main) => match main.as_str() {
+            None => Some(format!(
+                "INTERNAL_PLUGIN_ENTRY_MAIN_NOT_STRING: {}",
+                manifest_path.display()
+            )),
+            Some(main) if entry.join(main).is_file() => None,
+            Some(main) => Some(format!(
+                "INTERNAL_PLUGIN_ENTRY_MAIN_MISSING: {}",
+                entry.join(main).display()
+            )),
+        },
+    }
 }
 
 /// 清理 profile bundle 列表中的重复引用，保留首次出现的顺序。
@@ -125,32 +165,6 @@ pub(super) fn remove_internal_plugin_bundles(
     modified
 }
 
-pub(crate) fn skip_unavailable_plugins(
-    profile: &Path,
-    names: &HashSet<&str>,
-) -> Result<(), String> {
-    let names = names
-        .iter()
-        .copied()
-        .filter(|name| !internal_plugin_entry_is_ready(&profile.join("node_modules").join(name)))
-        .collect::<HashSet<_>>();
-    if names.is_empty() {
-        return Ok(());
-    }
-    let path = profile.join("package.json");
-    let raw = match std::fs::read(&path) {
-        Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(format!("INTERNAL_PLUGIN_MANIFEST_READ_FAILED: {error}")),
-    };
-    let mut manifest: serde_json::Value = serde_json::from_slice(&raw)
-        .map_err(|error| format!("INTERNAL_PLUGIN_MANIFEST_PARSE_FAILED: {error}"))?;
-    if remove_internal_plugin_bundles(&mut manifest, &names) {
-        write_profile_manifest(&path, &manifest)?;
-    }
-    Ok(())
-}
-
 /// 经同目录临时文件原子替换 profile 清单，失败时保留原文件。
 pub(super) fn write_profile_manifest(
     path: &Path,
@@ -185,7 +199,7 @@ fn replace_manifest_file(temp: &Path, path: &Path) -> std::io::Result<()> {
 fn replace_manifest_file(temp: &Path, path: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
 
     let temp_wide: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -374,6 +388,68 @@ mod tests {
     }
 
     #[test]
+    fn entry_problem_identifies_which_step_of_the_readiness_check_failed() {
+        let root = tempfile::tempdir().unwrap();
+        let entry = root.path().join("node_modules/dsh-tauri");
+        let manifest = entry.join("package.json");
+
+        let unreadable = internal_plugin_entry_problem(&entry).unwrap();
+        assert!(
+            unreadable.starts_with("INTERNAL_PLUGIN_ENTRY_MANIFEST_UNREADABLE: "),
+            "{unreadable}"
+        );
+        assert!(
+            unreadable.contains(&manifest.display().to_string()),
+            "{unreadable}"
+        );
+
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(&manifest, br#"{"name":"dsh-tauri""#).unwrap();
+        let invalid = internal_plugin_entry_problem(&entry).unwrap();
+        assert!(
+            invalid.starts_with("INTERNAL_PLUGIN_ENTRY_MANIFEST_INVALID: "),
+            "{invalid}"
+        );
+        assert!(invalid.contains(&manifest.display().to_string()), "{invalid}");
+
+        std::fs::write(&manifest, b"[]").unwrap();
+        assert_eq!(
+            internal_plugin_entry_problem(&entry),
+            Some(format!(
+                "INTERNAL_PLUGIN_ENTRY_MANIFEST_NOT_OBJECT: {}",
+                manifest.display()
+            ))
+        );
+
+        std::fs::write(&manifest, br#"{"main":5}"#).unwrap();
+        assert_eq!(
+            internal_plugin_entry_problem(&entry),
+            Some(format!(
+                "INTERNAL_PLUGIN_ENTRY_MAIN_NOT_STRING: {}",
+                manifest.display()
+            ))
+        );
+
+        std::fs::write(&manifest, br#"{"main":"./dist/index.js"}"#).unwrap();
+        let declared = entry.join("./dist/index.js");
+        assert_eq!(
+            internal_plugin_entry_problem(&entry),
+            Some(format!(
+                "INTERNAL_PLUGIN_ENTRY_MAIN_MISSING: {}",
+                declared.display()
+            ))
+        );
+
+        std::fs::create_dir_all(entry.join("dist")).unwrap();
+        std::fs::write(entry.join("dist/index.js"), b"export function apply() {}").unwrap();
+        assert_eq!(internal_plugin_entry_problem(&entry), None);
+        assert!(internal_plugin_entry_is_ready(&entry));
+
+        std::fs::write(&manifest, br#"{"name":"dsh-tauri"}"#).unwrap();
+        assert_eq!(internal_plugin_entry_problem(&entry), None);
+    }
+
+    #[test]
     fn duplicate_profile_bundles_are_removed_without_reordering() {
         let mut manifest = serde_json::json!({
             "dsh": { "profile": { "bundles": ["dsh-tauri", "dshmarket", "dsh-tauri", "dshmarket"] } }
@@ -437,9 +513,11 @@ mod tests {
             std::fs::read_to_string(path.join("sentinel")).unwrap(),
             "original"
         );
-        assert!(!root
-            .join(format!("package.json.internal.{}.tmp", std::process::id()))
-            .exists());
+        assert!(
+            !root
+                .join(format!("package.json.internal.{}.tmp", std::process::id()))
+                .exists()
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -528,7 +606,7 @@ mod tests {
                 "dsh-tauri": "link:D:/gone/packages/dsh-tauri",
                 "dshmarket": "github:dsh-market/dshmarket",
                 "dsh-better-sidebar": "1.0.0",
-                "dsh-tauri-pet": "link:missing-sibling-package"
+                "dsh-tauri-archive": "link:missing-sibling-package"
             }
         });
         let keep = HashSet::from(["dsh-tauri"]);
@@ -537,7 +615,7 @@ mod tests {
 
         assert_eq!(
             dangling,
-            vec!["dsh-tauri-panel".to_string(), "dsh-tauri-pet".to_string()]
+            vec!["dsh-tauri-archive".to_string(), "dsh-tauri-panel".to_string()]
         );
         let _ = std::fs::remove_dir_all(root);
     }

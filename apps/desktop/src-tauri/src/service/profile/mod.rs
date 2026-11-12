@@ -9,6 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub mod migrate;
+pub(crate) mod mutation;
 
 /// 桌面端默认档案（内置，不可删除，首装默认选中）
 pub const DEFAULT_PROFILE: &str = "desktop";
@@ -29,15 +30,16 @@ pub(crate) fn carrier_node_args(desktop_host: bool) -> [std::ffi::OsString; 2] {
     ]
 }
 
-/// 安全模式档案：仅加载 web 模板核心 bundles、不带任何用户插件/补丁层。
-/// 错误界面「安全模式」按钮切到此档案重启（`--profile safe`），隔离问题插件
-/// 让应用先可用，用户随后在档案列表切回原档案即退出安全模式。
-pub const SAFE_PROFILE: &str = "safe";
-
 /// 新建档案的初始 bundles：web 模板（`@deepseek-ai/dsh-base` +
 /// `@deepseek-ai/dsh-web-app`，与 dsh-app-boot `PROFILE_TEMPLATES.web` 一致）。
 /// 桌面端内嵌的是 dsh web 应用，新档案不带 `dsh-web-app` 将无法渲染任何界面。
 const WEB_PROFILE_BUNDLES: [&str; 2] = ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"];
+
+/// 桌面端默认追加的官方可选 bundle：官方工作树（`create_worktree` 工具 +
+/// `ctx.worktrees` 运行时）。上游把它列为 optional bundle，默认不装配，需要档案
+/// 显式登记才生效；桌面端不再自带工作树实现，因此在这里统一补上，行为等同于
+/// 用户自己在插件页把它打开。
+const DESKTOP_DEFAULT_BUNDLES: [&str; 1] = ["@deepseek-ai/dsh-experimental-tool-worktree"];
 
 /// CLI 侧其它 surface 的 bundle（dsh-app-boot `PROFILE_TEMPLATES` 中除 web 外的
 /// 模板）。它们与 web 层存在同名 insert 行（如 `code-runtime`），把 web 层叠加到
@@ -290,9 +292,6 @@ pub fn active_profile<R: tauri::Runtime>(app_handle: &AppHandle<R>) -> String {
     if let Some(profile) = crate::service::workflow::instances::current_profile() {
         return profile;
     }
-    if crate::service::workflow::instances::safe_mode() {
-        return SAFE_PROFILE.to_string();
-    }
     let stored = config::get_store_dat_setting(app_handle).active_profile;
     if !stored.is_empty()
         && stored != DEFAULT_PROFILE
@@ -443,7 +442,6 @@ pub fn set_active<R: tauri::Runtime>(app_handle: &AppHandle<R>, id: &str) -> Res
     config::update_store_dat_setting(app_handle, |setting| {
         setting.active_profile = id.to_string();
     });
-    crate::service::workflow::instances::set_safe_mode(false);
     select(app_handle, id)
 }
 
@@ -478,17 +476,6 @@ pub fn ensure_desktop_profile(app_handle: &AppHandle) {
     if let Err(e) = ensure_desktop_profile_with_root(&profiles_root) {
         log::warn!("Desktop profile init failed: {e}");
     }
-}
-
-/// 确保安全模式档案目录存在且含核心 web bundle 层（幂等，绝不覆盖用户改动）。
-///
-/// 与 `ensure_desktop_profile_with_root` 同构：已存在时复用档案内容，只补齐缺失的
-/// 档案文件与核心 bundle 条目（web 模板 bundles，可正常渲染桌面内嵌的 web UI）。
-/// 安全档案只含核心 bundles 与空 patch 层——不装任何用户插件，用于错误界面
-/// 「安全模式」按钮把问题插件隔离在启动链路之外。
-pub fn ensure_safe_profile(app_handle: &AppHandle) -> Result<(), String> {
-    let profiles_root = config::get_dsh_data_path(app_handle).join("profiles");
-    init_profile_dir(&profiles_root.join(SAFE_PROFILE), SAFE_PROFILE)
 }
 
 /// 删除档案（默认档案与使用中的档案不可删除）。
@@ -626,10 +613,10 @@ fn copy_dir_tree(src: &Path, dst: &Path) -> Result<(), String> {
         .try_for_each(|entry| -> Result<(), String> {
             let name = entry.file_name();
             // 仅跳过运行时产物（不随克隆迁移）
-            if let Some(s) = name.to_str() {
-                if crate::config::HARNESS_PID_MARKER_NAMES.contains(&s) || s == ".backups" {
-                    return Ok(());
-                }
+            if let Some(s) = name.to_str()
+                && (crate::config::HARNESS_PID_MARKER_NAMES.contains(&s) || s == ".backups")
+            {
+                return Ok(());
             }
             let src_path = entry.path();
             let dst_path = dst.join(&name);
@@ -696,13 +683,18 @@ fn rewrite_manifest_name_atomic(path: &Path, manifest: &serde_json::Value) -> Re
 }
 
 /// 初始化档案目录：与官方 `dsh-app-boot::initProfile` 的产物一致
-/// 官方 `initProfile` 形态的档案清单（web 模板 bundles）。
+/// 官方 `initProfile` 形态的档案清单（web 模板 bundles + 桌面端默认官方 bundle）。
 fn web_profile_manifest(id: &str) -> serde_json::Value {
+    let bundles: Vec<&str> = WEB_PROFILE_BUNDLES
+        .iter()
+        .chain(DESKTOP_DEFAULT_BUNDLES.iter())
+        .copied()
+        .collect();
     serde_json::json!({
         "name": format!("dsh-profile-{id}"),
         "private": true,
         "dependencies": {},
-        "dsh": { "profile": { "bundles": WEB_PROFILE_BUNDLES } }
+        "dsh": { "profile": { "bundles": bundles } }
     })
 }
 
@@ -763,11 +755,13 @@ fn ensure_profile_core_bundles(dir: &Path, id: &str) -> Result<bool, String> {
         .iter()
         .map(|bundle| (*bundle).to_string())
         .collect();
+    desired.extend(DESKTOP_DEFAULT_BUNDLES.iter().map(|bundle| (*bundle).to_string()));
     desired.extend(
         current
             .iter()
             .filter(|bundle| {
                 !WEB_PROFILE_BUNDLES.contains(&bundle.as_str())
+                    && !DESKTOP_DEFAULT_BUNDLES.contains(&bundle.as_str())
                     && bundle.as_str() != "@deepseek-ai/dsh-experimental-schedule-bundle"
             })
             .cloned(),
@@ -864,8 +858,8 @@ pub(crate) fn prepare_at(data_home: &Path, id: &str) -> Result<bool, String> {
 fn init_profile_dir(dir: &Path, id: &str) -> Result<(), String> {
     // 建目录 + 真实写入探测：目录已存在但属主不是当前用户时（issue #466，典型：
     // 此前用 sudo 运行过 dsh），std 的 `create_dir_all` 会直接返回 Ok，直到后面
-    // 写清单才以裸 EACCES 失败——安全模式报的 `PROFILE_MKDIR: Permission denied`
-    // 就是这条路径。用 perm 的探测把「不可写 + 属主 + chown 命令」在最早一步给出。
+    // 写清单才以裸 EACCES 失败——`PROFILE_MKDIR: Permission denied` 报的就是这条
+    // 路径。用 perm 的探测把「不可写 + 属主 + chown 命令」在最早一步给出。
     crate::service::perm::ensure_dir_writable(dir, "PROFILE_MKDIR")?;
 
     ensure_profile_core_bundles(dir, id)?;
@@ -1070,6 +1064,7 @@ mod tests {
             serde_json::json!([
                 "@deepseek-ai/dsh-base",
                 "@deepseek-ai/dsh-web-app",
+                "@deepseek-ai/dsh-experimental-tool-worktree",
                 "user-plugin"
             ])
         );
@@ -1253,7 +1248,7 @@ mod tests {
         assert_eq!(manifest["dependencies"], serde_json::json!({}));
         assert_eq!(
             manifest["dsh"]["profile"]["bundles"],
-            serde_json::json!(["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"])
+            serde_json::json!(["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "@deepseek-ai/dsh-experimental-tool-worktree"])
         );
         assert!(dir.join("cordis.patch.yml").is_file());
         assert!(dir.join("pnpm-workspace.yaml").is_file());
@@ -1283,7 +1278,7 @@ mod tests {
         assert_eq!(manifest["name"], "dsh-profile-desktop");
         assert_eq!(
             manifest["dsh"]["profile"]["bundles"],
-            serde_json::json!(["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"])
+            serde_json::json!(["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "@deepseek-ai/dsh-experimental-tool-worktree"])
         );
         assert!(dir.join("cordis.patch.yml").is_file());
         assert!(dir.join("pnpm-workspace.yaml").is_file());
@@ -1345,8 +1340,8 @@ mod tests {
         let manifest = serde_json::json!({
             "name": "dsh-profile-tauri",
             "private": true,
-            "dependencies": { "dsh-tauri-pet": "link:C:/app/resources/node_modules/dsh-tauri-pet" },
-            "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "dsh-tauri-pet", "dsh-better-sidebar"] } }
+            "dependencies": { "dsh-tauri-archive": "link:C:/app/resources/node_modules/dsh-tauri-archive" },
+            "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "dsh-tauri-archive", "dsh-better-sidebar"] } }
         });
         std::fs::write(
             dir.join("package.json"),
@@ -1365,15 +1360,16 @@ mod tests {
             serde_json::json!([
                 "@deepseek-ai/dsh-base",
                 "@deepseek-ai/dsh-web-app",
-                "dsh-tauri-pet",
+                "@deepseek-ai/dsh-experimental-tool-worktree",
+                "dsh-tauri-archive",
                 "dsh-better-sidebar"
             ])
         );
         // 依赖声明、名称等其它字段原样保留
         assert_eq!(repaired["name"], "dsh-profile-tauri");
         assert_eq!(
-            repaired["dependencies"]["dsh-tauri-pet"],
-            "link:C:/app/resources/node_modules/dsh-tauri-pet"
+            repaired["dependencies"]["dsh-tauri-archive"],
+            "link:C:/app/resources/node_modules/dsh-tauri-archive"
         );
 
         // 幂等：已含核心层的档案不再写盘（内容逐字节不变）
@@ -1395,7 +1391,8 @@ mod tests {
             serde_json::json!([
                 "@deepseek-ai/dsh-base",
                 "@deepseek-ai/dsh-web-app",
-                "dsh-tauri-scheduler",
+                "@deepseek-ai/dsh-experimental-tool-worktree",
+                "dsh-tauri-archive",
                 "user-plugin",
                 "@deepseek-ai/dsh-experimental-schedule-bundle"
             ]),
@@ -1403,7 +1400,7 @@ mod tests {
                 "@deepseek-ai/dsh-base",
                 "@deepseek-ai/dsh-web-app",
                 "@deepseek-ai/dsh-experimental-schedule-bundle",
-                "dsh-tauri-scheduler",
+                "dsh-tauri-archive",
                 "user-plugin",
                 "@deepseek-ai/dsh-experimental-schedule-bundle"
             ]),
@@ -1421,7 +1418,8 @@ mod tests {
             expected["dsh"]["profile"]["bundles"] = serde_json::json!([
                 "@deepseek-ai/dsh-base",
                 "@deepseek-ai/dsh-web-app",
-                "dsh-tauri-scheduler",
+                "@deepseek-ai/dsh-experimental-tool-worktree",
+                "dsh-tauri-archive",
                 "user-plugin"
             ]);
 
@@ -1474,7 +1472,7 @@ mod tests {
         assert_eq!(manifest["dependencies"], serde_json::json!({}));
         assert_eq!(
             manifest["dsh"]["profile"]["bundles"],
-            serde_json::json!(["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"])
+            serde_json::json!(["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "@deepseek-ai/dsh-experimental-tool-worktree"])
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1532,6 +1530,7 @@ mod tests {
             serde_json::json!([
                 "@deepseek-ai/dsh-base",
                 "@deepseek-ai/dsh-web-app",
+                "@deepseek-ai/dsh-experimental-tool-worktree",
                 "dsh-tauri"
             ])
         );
@@ -1571,7 +1570,7 @@ mod tests {
         assert_eq!(manifest["dependencies"], serde_json::json!({}));
         assert_eq!(
             manifest["dsh"]["profile"]["bundles"],
-            serde_json::json!(["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"])
+            serde_json::json!(["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "@deepseek-ai/dsh-experimental-tool-worktree"])
         );
         // 会话数据完整保留
         assert!(sessions.join("_no-cwd").join("s1.json").is_file());

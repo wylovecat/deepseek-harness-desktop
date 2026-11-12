@@ -3,12 +3,12 @@
 //! 只基于文件系统与 PATH 探测，不派生子进程。核心来源判定见
 //! [`crate::service::core`] 模块头的说明。
 
-use crate::{AppHandle};
+use crate::AppHandle;
 use crate::service::cli;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use tauri::Manager;
-use tauri::{ Runtime};
+use tauri::Runtime;
 
 /// 解析出的本地核心信息
 pub(super) struct LocalCore {
@@ -255,10 +255,10 @@ fn prefix_candidates(bin: &Path) -> Vec<PathBuf> {
     let mut prefixes = vec![bin_dir.to_path_buf()];
     let dir_name = bin_dir.file_name().and_then(|n| n.to_str());
     // 仅当 bin 目录名为 `bin` 时才把父目录作为前缀候选，避免无关目录被误判
-    if dir_name == Some("bin") {
-        if let Some(parent) = bin_dir.parent() {
-            prefixes.push(parent.to_path_buf());
-        }
+    if dir_name == Some("bin")
+        && let Some(parent) = bin_dir.parent()
+    {
+        prefixes.push(parent.to_path_buf());
     }
     // fnm/pnpm 全局布局：shim 位于 `<prefix>/node_modules/.bin`，包目录位于
     // `<prefix>/node_modules/@deepseek-ai/dsh`，故前缀候选取 `.bin` 的祖父目录
@@ -269,10 +269,9 @@ fn prefix_candidates(bin: &Path) -> Vec<PathBuf> {
             .and_then(|n| n.file_name())
             .and_then(|n| n.to_str())
             == Some("node_modules")
+        && let Some(prefix) = bin_dir.parent().and_then(Path::parent)
     {
-        if let Some(prefix) = bin_dir.parent().and_then(Path::parent) {
-            prefixes.push(prefix.to_path_buf());
-        }
+        prefixes.push(prefix.to_path_buf());
     }
     prefixes
 }
@@ -385,7 +384,7 @@ pub async fn update_local_core<R: Runtime>(app_handle: AppHandle<R>) -> Result<S
     let minimum = crate::config::manifest::minimum_dsh_version(&app_handle)
         .as_deref()
         .and_then(|version| semver::Version::parse(version).ok());
-    if !crate::config::get_dsh_binary_path(&app_handle).is_file()
+    if !crate::config::core_entry_exists(&crate::config::get_dsh_binary_path(&app_handle))
         || !managed_version
             .zip(minimum)
             .is_some_and(|(version, minimum)| version >= minimum)
@@ -413,6 +412,8 @@ pub async fn update_local_core<R: Runtime>(app_handle: AppHandle<R>) -> Result<S
     } else {
         pm.to_string()
     };
+    let installed = core.version.clone();
+    let current = semver::Version::parse(&installed).ok();
     let (target_version, status, stdout, stderr) =
         tauri::async_runtime::spawn_blocking(move || {
             let mut query = std::process::Command::new(&program);
@@ -446,8 +447,19 @@ pub async fn update_local_core<R: Runtime>(app_handle: AppHandle<R>) -> Result<S
             }
             .ok_or_else(|| "CORE_UPDATE_TARGET_INVALID: expected one version".to_string())?
             .to_string();
-            semver::Version::parse(&target_version)
+            let target = semver::Version::parse(&target_version)
                 .map_err(|e| format!("CORE_UPDATE_TARGET_INVALID: {e}"))?;
+            // 包管理器的 `latest` 与 pkg 仓库的最新稳定版不是同一个东西：本地装的
+            // 预发布版（或手动指定的更高版本）完全可能高于 npm 的 latest，照着装就是
+            // 一次静默降级。宁可拒绝，让用户自己在包管理器里挑版本。
+            if current
+                .as_ref()
+                .is_some_and(|current| target < *current)
+            {
+                return Err(format!(
+                    "CORE_UPDATE_TARGET_OLDER: {pm} would install {target_version}, older than the installed {installed}"
+                ));
+            }
             let package = format!("@deepseek-ai/dsh@{target_version}");
             log::info!("Updating local dsh core via `{pm} {action} -g {package}`");
             let mut cmd = std::process::Command::new(&program);

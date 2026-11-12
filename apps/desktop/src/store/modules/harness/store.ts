@@ -15,6 +15,7 @@ import type { PatchEntryStripReport, PatchQuarantineReport } from '@/types/plugi
 import type { Profile } from '@/types/profile'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import i18next from 'i18next'
 import semver from 'semver'
 import { defineStore } from 'valtio-define'
@@ -22,6 +23,7 @@ import { queryClient } from '@/config/client'
 import { hooks } from '@/config/hooks'
 import { queryKeys } from '@/config/query-keys'
 import { toast } from '@/utils/toast'
+import { isHostedDocument, isHostedServiceDocument } from '@/utils/window-presentation'
 import { harnessUpdater } from '../harness-updater'
 import { parseBlockedRefusal } from '../plugins'
 import { preinstall } from '../preinstall'
@@ -61,9 +63,8 @@ const STARTUP_STATUS_KEYS: Record<StartupPhase, string> = {
 
 /** 补丁层修复动作的失败日志前缀（保留各入口原有的可检索文案） */
 const PATCH_REPAIR_LOG: Record<PatchRepairAction, string> = {
-  'safe-mode': '[Harness] enter safe mode failed:',
-  'quarantine': '[Harness] quarantine broken patch layers failed:',
-  'strip': '[Harness] strip unresolved patch entries failed:',
+  quarantine: '[Harness] quarantine broken patch layers failed:',
+  strip: '[Harness] strip unresolved patch entries failed:',
 }
 
 const initialInstaller: InstallerState = {
@@ -85,6 +86,11 @@ const restartFlight = new SingleFlight<void>()
 const webviewReloadGate = new BoundedReloadGate(WEBVIEW_RELOAD_MAX_ATTEMPTS)
 let webviewRefreshTimer: ReturnType<typeof setTimeout> | undefined
 let policyApprovalKey: string | undefined
+let restartToastKey: string | undefined
+let restartOperationId: string | undefined
+let restartPhase: 'leaving' | 'stopping' | 'loading' | undefined
+const restoreRestartFlight = new SingleFlight<boolean>()
+const finishRestartFlight = new SingleFlight<boolean>()
 
 /**
  * 桌面外壳核心业务模块：安装/启动流程、服务生命周期（启动/健康检查/重启/停止）、
@@ -127,6 +133,7 @@ export const harness = defineStore({
      */
     webviewAliveKey: null as number | null,
     webviewKey: 0,
+    restartPending: false,
     serviceHealthy: false,
     serviceRunning: false,
     startupPhase: 'plugin-install' as StartupPhase,
@@ -155,6 +162,75 @@ export const harness = defineStore({
     },
   },
   actions: {
+    showRestartLoading() {
+      if (restartToastKey !== undefined && toast.isActive(restartToastKey))
+        return
+      restartToastKey = toast(i18next.t('messages.harness_restarting'), {
+        placement: 'bottom end',
+        timeout: 0,
+        sticky: true,
+        isLoading: true,
+      })
+    },
+
+    restoreRestartToast(): Promise<boolean> {
+      return restoreRestartFlight.run(async () => {
+        if (restartOperationId !== undefined)
+          return true
+        try {
+          const operation = await invoke<{ id: string, phase: 'leaving' | 'stopping' | 'loading' } | null>('get_harness_restart')
+          if (restartOperationId !== undefined)
+            return true
+          if (!operation)
+            return false
+          restartOperationId = operation.id
+          restartPhase = operation.phase
+          this.restartPending = true
+          this.showRestartLoading()
+          return true
+        }
+        catch (error) {
+          console.error('[Harness] restore restart notification failed:', error)
+          return false
+        }
+      })
+    },
+
+    completeRestartDocument(): Promise<boolean> {
+      return this.finishRestartNotification('success')
+    },
+
+    finishRestartNotification(outcome: 'success' | 'error', description?: string): Promise<boolean> {
+      return finishRestartFlight.run(async () => {
+        await this.restoreRestartToast()
+        const id = restartOperationId
+        if (id === undefined)
+          return false
+        try {
+          const accepted = await invoke<boolean>('finish_harness_restart', { id, outcome })
+          if (!accepted || restartOperationId !== id)
+            return false
+          restartOperationId = undefined
+          this.restartPending = false
+          if (restartToastKey !== undefined) {
+            toast.close(restartToastKey)
+            restartToastKey = undefined
+          }
+          if (outcome === 'success' && this.status !== 'error') {
+            toast(i18next.t('messages.harness_restarted'), { placement: 'bottom end', variant: 'success' })
+          }
+          else {
+            toast(i18next.t('messages.harness_restart_failed'), { placement: 'bottom end', variant: 'danger', description: description ?? this.errorMsg })
+          }
+        }
+        catch (error) {
+          console.error('[Harness] settle restart notification failed:', error)
+          return false
+        }
+        return true
+      })
+    },
+
     resetFrontendPreload() {
       this.frontendGeneration++
       this.frontendBootHtml = null
@@ -173,7 +249,26 @@ export const harness = defineStore({
         recovery.listen(),
         this.listenInternalPhase(),
         this.listenProcessExit(),
+        this.listenPluginBootFailure(),
       ])
+      if (isHostedServiceDocument())
+        return
+      await this.restoreRestartToast()
+      if (restartOperationId !== undefined && (restartPhase === 'leaving' || restartPhase === 'stopping')) {
+        this.busyAction = 'restart'
+        try {
+          if (!await invoke<boolean>('resume_harness_restart', { id: restartOperationId }))
+            throw new Error('HARNESS_RESTART_RESUME_REJECTED')
+          restartPhase = 'loading'
+        }
+        catch (error) {
+          this.fail(String(error))
+          return
+        }
+        finally {
+          this.busyAction = null
+        }
+      }
       await this.boot()
     },
 
@@ -186,6 +281,24 @@ export const harness = defineStore({
       }
       catch (err) {
         console.error('[Harness] failed to listen harness-process-exited:', err)
+      }
+    },
+
+    /**
+     * 订阅内嵌 guest 上报的启动失败卡片：`plugin_boot.js.inc` 把上游失败页逐项发出，
+     * 壳层据此走与「文档即 DSH」相同的恢复流程。`dsh://` 事件按窗口投递，必须显式
+     * 声明目标窗口，否则收不到。
+     */
+    async listenPluginBootFailure() {
+      try {
+        await listen<{ label?: string, detail?: string }>('dsh://plugin-boot:failed', ({ payload }) => {
+          if (payload?.detail === undefined || payload.detail === '')
+            return
+          void this.handleWebviewBootFailure(payload.detail)
+        }, { target: { kind: 'Window', label: getCurrentWindow().label } })
+      }
+      catch (err) {
+        console.error('[Harness] failed to listen dsh://plugin-boot:failed:', err)
       }
     },
 
@@ -206,6 +319,9 @@ export const harness = defineStore({
       })) {
         return
       }
+
+      if (isHostedServiceDocument() && await invoke('get_remote_shell_state') !== null)
+        return
 
       const probe = await checkHealthViaProxy()
       if (!shouldAcceptRuntimeExit({
@@ -338,6 +454,18 @@ export const harness = defineStore({
       this.webviewLoaded = false
     },
 
+    /**
+     * 文档即 DSH：本 webview 本身就是服务产物，启动流程被跳过，这里把运行时状态
+     * 直接推进到「已就绪」，否则 `status` / `serviceHealthy` 会停在初值，
+     * 依赖它们的导航栏控件（侧栏开关、远程/本地切换）全部不渲染。
+     */
+    markHostedReady() {
+      this.serviceHealthy = true
+      this.serviceRunning = true
+      this.status = 'ready'
+      this.errorMsg = ''
+    },
+
     markWebviewBootReady() {
       webviewReloadGate.markReady()
       if (webviewRefreshTimer !== undefined) {
@@ -377,24 +505,31 @@ export const harness = defineStore({
     },
 
     async handleWebviewBootFailure(detail?: string) {
+      // 下面两次异步等待期间可能已经重启/重挂：沿用旧结论会把新一轮启动改成错误态。
+      const generation = this.webviewKey
+      const token = bootToken
+      const current = () => generation === this.webviewKey && token === bootToken
       const message = detail && detail.includes('Failed to load plugins')
         ? detail
         : i18next.t('errors.client_boot_failed')
       const error = await attachStartupDiagnostics(new Error(message))
       // 失败页文本是最直接的证据，优先作为日志行参与插件定位（pending 行正则
       // 可命中 `dsh-tauri-rightclick: pending (waiting for service: remote.session)`）
-      const lines = [
-        ...(detail ? detail.split(/\n/) : []),
-        ...(error.logLines ?? error.logs ?? []),
-      ]
-      await recovery.reviewStartupRecovery(lines)
+      const reported = detail ? detail.split(/\n/).filter(line => line.trim() !== '') : []
+      const lines = [...reported, ...(error.logLines ?? error.logs ?? [])]
+      await recovery.reviewStartupRecovery(lines, current)
+      if (!current())
+        return
+      // 服务日志里往往没有这张失败页（插件在客户端激活失败，宿主侧无异常行），
+      // 因此错误页必须展示失败页原文，否则用户只看到「客户端报告了失败」。
       this.fail(
         error.message,
-        error.logs,
+        reported.length > 0 ? reported : error.logs,
         error.pluginConflictHint,
         error.inotifyLimitHint,
         this.serviceRunning,
         error.patchLayerHint,
+        error.heapOomHint,
       )
     },
 
@@ -789,6 +924,8 @@ export const harness = defineStore({
       this.heapOomHint = heapOomHint ?? ''
       this.status = 'error'
       this.serviceRunning = keepServiceRunning
+      if (restartOperationId !== undefined)
+        void this.finishRestartNotification('error', message)
     },
 
     async switchProfile(id: string) {
@@ -823,6 +960,28 @@ export const harness = defineStore({
         if (this.busyAction)
           return
         this.busyAction = 'restart'
+        this.showRestartLoading()
+        const previouslyHealthy = this.serviceHealthy
+        this.serviceHealthy = false
+        try {
+          const operation = await invoke<{ id: string }>('begin_harness_restart')
+          restartOperationId = operation.id
+          this.restartPending = true
+        }
+        catch (error) {
+          if (restartToastKey !== undefined) {
+            toast.close(restartToastKey)
+            restartToastKey = undefined
+          }
+          this.busyAction = null
+          this.serviceHealthy = previouslyHealthy
+          toast(i18next.t('messages.harness_restart_failed'), {
+            placement: 'bottom end',
+            variant: 'danger',
+            description: String(error),
+          })
+          return
+        }
         ++bootToken
         this.resetFrontendPreload()
         // 重启旧进程前先撤下旧 webview；这样延迟到达的旧进程退出事件不会被
@@ -833,36 +992,26 @@ export const harness = defineStore({
         // 手动重启（含修复界面上的「重启 Harness」）：先退出恢复态，
         // 若重启仍失败，boot 的 catch 会重新定位问题插件并再次弹出。
         recovery.hide()
+        const leaving = isHostedServiceDocument()
         try {
           void hooks['config.dialog.hidden'].trigger()
-          await invoke('shutdown_harness')
-        }
-        catch (err) {
-          console.error('[Harness] shutdown during restart failed:', err)
-        }
-        this.serviceRunning = false
-        try {
+          if (!await invoke<boolean>('prepare_harness_restart', { id: restartOperationId }))
+            throw new Error('HARNESS_RESTART_PREPARE_REJECTED')
+          if (leaving)
+            return
+          if (!await invoke<boolean>('resume_harness_restart', { id: restartOperationId }))
+            throw new Error('HARNESS_RESTART_RESUME_REJECTED')
+          restartPhase = 'loading'
+          this.serviceRunning = false
           await this.boot()
         }
-        finally {
-          this.busyAction = null
+        catch (error) {
+          this.fail(String(error), undefined, undefined, undefined, this.serviceRunning)
         }
-      })
-    },
-
-    /**
-     * 进入安全模式：切到 safe 档案（仅核心 bundles、无用户插件）并重启服务。
-     * 启动失败的插件（如 pending waiting for service）被隔离，应用先恢复可用；
-     * 用户在档案列表切回原档案即退出安全模式。
-     *
-     * 后端同时会隔离「解析不了的补丁层」（安全档案层 + home 层，见
-     * `service::plugin::patch_guard`）：home 层作用于所有档案，不隔离的话一处
-     * 手写笔误会让安全模式也起不来（issue #525）。结果用 toast 告知备份路径。
-     */
-    async enterSafeMode() {
-      await this.runPatchRepair('safe-mode', async () => {
-        const report = await invoke<PatchQuarantineReport>('enter_safe_mode')
-        notifyPatchQuarantine(report)
+        finally {
+          if (!leaving || this.status === 'error')
+            this.busyAction = null
+        }
       })
     },
 
@@ -924,10 +1073,7 @@ export const harness = defineStore({
       finally {
         this.busyAction = null
       }
-      if (action === 'safe-mode')
-        await this.start()
-      else
-        await this.restart()
+      await this.restart()
     },
 
     /** 停止服务并回到停止态界面 */
@@ -959,19 +1105,6 @@ export const harness = defineStore({
       recovery.reset()
     },
 
-    /** 服务未运行时点击"重试"：重新拉起服务并等待健康检查 */
-    async start() {
-      if (this.busyAction)
-        return
-      this.busyAction = 'start'
-      try {
-        await this.boot()
-      }
-      finally {
-        this.busyAction = null
-      }
-    },
-
     /** 在系统浏览器中打开服务地址 */
     async openBrowser() {
       if (this.busyAction)
@@ -992,6 +1125,10 @@ export const harness = defineStore({
 
 let webviewWatch: { key: number, loaded: boolean, timer: ReturnType<typeof setTimeout> } | null = null
 harness.$subscribe(() => {
+  // 主窗口文档即 DSH 时没有原生子视图，`harness-webview-state` 不会回来；看门狗在这种
+  // 形态下必然误判，把已经正常显示的页面切成错误页（issue #1426 的反复闪烁）。
+  if (isHostedDocument())
+    return
   const { status, serviceHealthy, webviewKey, webviewLoaded, webviewError } = harness.$state
   const watching = status === 'ready' && serviceHealthy && !harness.webviewAlive && !webviewError
   const context = {

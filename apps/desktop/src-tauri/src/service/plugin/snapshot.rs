@@ -208,6 +208,15 @@ fn append_package_tree(
     dir: &Path,
     prefix: &Path,
 ) -> Result<(), String> {
+    let metadata = fs::metadata(dir).map_err(|e| format!("SNAPSHOT_METADATA: {e}"))?;
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Directory);
+    header.set_mode(snapshot_mode(&metadata));
+    header.set_size(0);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, prefix, std::io::empty())
+        .map_err(|e| format!("SNAPSHOT_APPEND_DIR: {e}"))?;
     for entry in fs::read_dir(dir).map_err(|e| format!("SNAPSHOT_READDIR: {e}"))? {
         let entry = entry.map_err(|e| format!("SNAPSHOT_ENTRY: {e}"))?;
         let path = entry.path();
@@ -218,20 +227,12 @@ fn append_package_tree(
         }
         let rel = prefix.join(entry.file_name());
         if meta.is_dir() {
-            let mut header = tar::Header::new_gnu();
-            header.set_entry_type(tar::EntryType::Directory);
-            header.set_mode(0o755);
-            header.set_size(0);
-            header.set_cksum();
-            builder
-                .append_data(&mut header, &rel, std::io::empty())
-                .map_err(|e| format!("SNAPSHOT_APPEND_DIR: {e}"))?;
             append_package_tree(builder, &path, &rel)?;
         } else {
             let file = fs::File::open(&path).map_err(|e| format!("SNAPSHOT_OPEN: {e}"))?;
             let mut header = tar::Header::new_gnu();
             header.set_size(meta.len());
-            header.set_mode(0o644);
+            header.set_mode(snapshot_mode(&meta));
             header.set_cksum();
             builder
                 .append_data(&mut header, &rel, file)
@@ -239,6 +240,16 @@ fn append_package_tree(
         }
     }
     Ok(())
+}
+
+fn snapshot_mode(metadata: &fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o777
+    }
+    #[cfg(not(unix))]
+    if metadata.is_dir() { 0o755 } else { 0o644 }
 }
 
 /// 创建快照归档：写入临时文件 → fsync → rename 到目标（同盘原子替换）。
@@ -340,16 +351,14 @@ fn resolve_spec(app_handle: &AppHandle, id: &str) -> String {
         return preset.spec.clone();
     }
     let manifest_path = profile_dir(app_handle).join("package.json");
-    if let Ok(text) = fs::read_to_string(&manifest_path) {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-            if let Some(spec) = value
-                .get("dependencies")
-                .and_then(|d| d.get(id))
-                .and_then(|v| v.as_str())
-            {
-                return spec.to_string();
-            }
-        }
+    if let Ok(text) = fs::read_to_string(&manifest_path)
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
+        && let Some(spec) = value
+            .get("dependencies")
+            .and_then(|d| d.get(id))
+            .and_then(|v| v.as_str())
+    {
+        return spec.to_string();
     }
     id.to_string()
 }
@@ -640,6 +649,7 @@ fn write_back_manifest_refs(app_handle: &AppHandle, id: &str, spec: &str) {
 
 /// 还原单个插件快照（覆盖式，内部停服务 + 三阶段切换 + 回滚）。
 pub async fn restore(app_handle: &AppHandle, id: &str) -> Result<(), String> {
+    let _guard = acquire_operation_lock().await?;
     // 范围限制：仅第三方可行动插件可还原
     if !is_actionable_plugin_ref(id) {
         return Err(format!(
@@ -656,11 +666,10 @@ pub async fn restore(app_handle: &AppHandle, id: &str) -> Result<(), String> {
     verify_archive_integrity(&archive_path, &manifest)?;
 
     // 操作锁 + 停止服务（与安装/卸载一致，还原期间避免资源竞争）
-    let _guard = acquire_operation_lock().await;
-    if crate::service::workflow::has_owned_process() {
-        if let Err(e) = crate::service::workflow::stop(app_handle.clone()).await {
-            log::warn!("failed to stop harness before plugin restore: {e}");
-        }
+    if crate::service::workflow::has_owned_process()
+        && let Err(e) = crate::service::workflow::stop(app_handle.clone()).await
+    {
+        log::warn!("failed to stop harness before plugin restore: {e}");
     }
 
     let profile = profile_dir(app_handle);
@@ -702,11 +711,9 @@ pub async fn restore(app_handle: &AppHandle, id: &str) -> Result<(), String> {
 
     // 阶段 3：切换（dest → backup，staging/package → dest），失败反转已做步骤
     let dest_existed = fs::symlink_metadata(&dest).is_ok();
-    if dest_existed {
-        if let Err(e) = fs::rename(&dest, &backup) {
-            let _ = fs::remove_dir_all(&staging);
-            return Err(format!("SNAPSHOT_SWITCH_BACKUP: {e}"));
-        }
+    if dest_existed && let Err(e) = fs::rename(&dest, &backup) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(format!("SNAPSHOT_SWITCH_BACKUP: {e}"));
     }
     if let Err(e) = fs::rename(&staged_pkg, &dest) {
         // 反转：清掉可能的半成品落点，备份还原回原位
@@ -735,10 +742,10 @@ pub async fn restore(app_handle: &AppHandle, id: &str) -> Result<(), String> {
     if !is_installed(app_handle, id) {
         write_back_manifest_refs(app_handle, id, &manifest.spec);
     }
-    if let Err(e) = fs::remove_file(profile.join("pnpm-lock.yaml")) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            log::warn!("failed to remove pnpm-lock.yaml after plugin restore: {e}");
-        }
+    if let Err(e) = fs::remove_file(profile.join("pnpm-lock.yaml"))
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        log::warn!("failed to remove pnpm-lock.yaml after plugin restore: {e}");
     }
     Ok(())
 }
@@ -746,6 +753,53 @@ pub async fn restore(app_handle: &AppHandle, id: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_round_trip_preserves_executable_and_private_file_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("source");
+        fs::create_dir_all(package.join("private")).unwrap();
+        for (name, mode) in [("helper", 0o751), ("private/config", 0o600)] {
+            let path = package.join(name);
+            fs::write(&path, b"original").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        fs::set_permissions(&package, fs::Permissions::from_mode(0o750)).unwrap();
+        fs::set_permissions(package.join("private"), fs::Permissions::from_mode(0o700)).unwrap();
+        let archive = root.path().join("snapshot.tgz");
+        let encoder = flate2::write::GzEncoder::new(
+            fs::File::create(&archive).unwrap(),
+            flate2::Compression::default(),
+        );
+        let mut builder = tar::Builder::new(encoder);
+        append_package_tree(&mut builder, &package, Path::new("package")).unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+        let target = root.path().join("restored");
+        crate::service::backup::archive::extract_archive_gzip(&archive, &target).unwrap();
+        for (name, expected) in [("helper", 0o751), ("private/config", 0o600)] {
+            let restored = target.join("package").join(name);
+            assert_eq!(fs::read(&restored).unwrap(), b"original");
+            assert_eq!(
+                fs::metadata(restored).unwrap().permissions().mode() & 0o7777,
+                expected,
+                "{name}"
+            );
+        }
+        for (name, expected) in [("package", 0o750), ("package/private", 0o700)] {
+            assert_eq!(
+                fs::metadata(target.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                expected,
+                "{name}"
+            );
+        }
+    }
 
     /// 构造临时 node_modules 下插件包目录（真实目录形态，非 pnpm 链接）。
     fn setup_package(root: &Path, name: &str) {

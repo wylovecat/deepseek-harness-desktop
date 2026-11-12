@@ -8,7 +8,7 @@ use crate::config;
 use crate::logger;
 use crate::service::{core, plugin, profile};
 use crate::AppHandle;
-use tauri_plugin_opener::OpenerExt;
+use tauri::Manager;
 
 /// 健康检查（通过 Rust 代理，避免 WebView CORS 问题）
 #[tauri::command]
@@ -65,10 +65,8 @@ pub async fn open_in_browser(
     crate::service::workflow::instances::scope(profile, async move {
         let url =
             config::get_dsh_service_url(crate::service::workflow::instances::port(&app_handle));
-        app_handle
-            .opener()
-            .open_url(url, None::<&str>)
-            .map_err(|e| e.to_string())
+        let client = app_handle.state::<tauri_runtime_electron::ElectronClient>();
+        tauri_runtime_electron::open_external(client.inner(), &url).await
     })
     .await
 }
@@ -90,6 +88,35 @@ pub async fn copy_service_url(
         crate::bridge::write_clipboard_text(url).await
     })
     .await
+}
+
+
+/// 「打开方式」受理成功后让出桌面前台（issue #1346）。
+///
+/// 目标程序由 Core 按目录所属应用拉起，壳只负责让位。Windows 不允许非前台进程
+/// 激活自己没有创建的窗口，页内 detached spawn 拉起来的窗口因此落在 DSH 后面；
+/// 这里改由 Electron 主进程的 `shell` 重新交接一次同一目录，激活走的是与双击
+/// 一致的系统路径。只有 Core 受理成功才会调到本命令，失败时页面保留窗口与错误。
+///
+/// 只接受壳内嵌的本地 Harness guest（label 形如 `harness-N`）：远程窗口的
+/// webview label 与所属窗口同名，注入脚本在远端也没有可调的 IPC。
+#[tauri::command]
+pub async fn open_in_app(
+    webview: crate::Webview,
+    app_handle: AppHandle,
+    path: Option<String>,
+) -> Result<(), String> {
+    if !webview.label().starts_with("harness-") {
+        return Err(format!("OPEN_IN_APP_REJECTED: {}", webview.label()));
+    }
+    if let Some(path) = path {
+        let client = app_handle.state::<tauri_runtime_electron::ElectronClient>();
+        tauri_runtime_electron::open_path(client.inner(), &path).await?;
+    }
+    webview
+        .window()
+        .minimize()
+        .map_err(|error| format!("OPEN_IN_APP_MINIMIZE_FAILED: {error}"))
 }
 
 /// 在系统文件管理器中定位指定文件（Session 日志下载完成后的"在文件夹中显示"）
@@ -255,7 +282,7 @@ pub async fn read_run_logs(
     let env_text = format_env_info(
         &app_version,
         dsh_version.as_deref(),
-        &config::get_active_node_version(),
+        &config::get_active_node_version(&app_handle),
         std::env::consts::OS,
         std::env::consts::ARCH,
         &profile::active_profile(&app_handle),
@@ -303,10 +330,8 @@ pub async fn open_external_url(app_handle: AppHandle, url: String) -> Result<(),
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return Err(format!("EXTERNAL_URL_INVALID: {url}"));
     }
-    app_handle
-        .opener()
-        .open_url(url, None::<&str>)
-        .map_err(|e| e.to_string())
+    let client = app_handle.state::<tauri_runtime_electron::ElectronClient>();
+    tauri_runtime_electron::open_external(client.inner(), &url).await
 }
 
 #[cfg(test)]

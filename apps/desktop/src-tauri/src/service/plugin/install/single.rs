@@ -2,11 +2,10 @@
 //! 与安装共用环境准备（shim、pnpm 选版、停止服务）与 allowBuilds 重试；
 //! 卸载后核验 profile 清单，插件仍被引用时走离线卸载兜底（受保护包除外）。
 
+use crate::{AppHandle, config};
 use std::ffi::OsString;
 use std::path::Path;
-use crate::AppHandle;
 
-use crate::config;
 use crate::service::cli;
 use crate::service::core;
 use crate::service::profile::active_profile;
@@ -15,9 +14,9 @@ use crate::service::workflow;
 use super::artifact::{ensure_plugin_entry_built, installed_package_name};
 use super::build_plugin_envs;
 use super::diagnose::{
-    git_transport_hint, incompatible_versions, network_error_hint, pick_error_message,
-    policy_blocked_versions, policy_verification_network_failure, store_mismatch_hint,
-    IncompatibleVersion, PolicyBlockedVersion,
+    IncompatibleVersion, PolicyBlockedVersion, git_transport_hint, incompatible_versions,
+    network_error_hint, pick_error_message, policy_blocked_versions,
+    policy_verification_network_failure, store_mismatch_hint,
 };
 use super::errors;
 use super::harness_prefer_bundled_pnpm;
@@ -43,6 +42,7 @@ use crate::service::profile::profile_release_age_excluded;
 /// 逐项核验的结果汇总成一条错误消息（见 [`update_failure_payload`]）：两个阶段各自的结算都
 /// 保留下来，前一段装上的目标不会被后一段的一般错误抹掉（见 [`UpdateFailure`]）。
 pub async fn update_many(app_handle: &AppHandle, specs: &[String]) -> Result<(), String> {
+    let _operation = super::acquire_operation_lock().await?;
     let mut requested: Vec<(String, Option<String>)> =
         specs.iter().map(|spec| split_upgrade_spec(spec)).collect();
     if requested.iter().any(|(_, version)| version.is_none()) {
@@ -347,17 +347,17 @@ fn update_failure_payload(failures: Vec<UpdateFailure>) -> Option<String> {
         // 版本兼容性拒绝照原样提升到顶层：前端只认这一行里的载荷来挂「授权后重跑」的按钮，
         // 落进下面的逐项失败里用户就只能看着一条纯文本，无从授权（与批量安装路径同形状）。
         // 载荷里的版本是 dsh 自己解析出来的那个，不改写——用户授权的是他看得见的东西。
-        if let Some(payload) = failure.message.strip_prefix(INCOMPATIBLE_PREFIX) {
-            if let Ok(entries) = serde_json::from_str::<Vec<IncompatibleVersion>>(payload) {
-                push_incompatible(entries, &mut incompatible);
-                continue;
-            }
+        if let Some(payload) = failure.message.strip_prefix(INCOMPATIBLE_PREFIX)
+            && let Ok(entries) = serde_json::from_str::<Vec<IncompatibleVersion>>(payload)
+        {
+            push_incompatible(entries, &mut incompatible);
+            continue;
         }
-        if let Some(payload) = failure.message.strip_prefix(POLICY_BLOCKED_PREFIX) {
-            if let Ok(entries) = serde_json::from_str::<Vec<PolicyBlockedVersion>>(payload) {
-                push_blocked(entries, &mut blocked);
-                continue;
-            }
+        if let Some(payload) = failure.message.strip_prefix(POLICY_BLOCKED_PREFIX)
+            && let Ok(entries) = serde_json::from_str::<Vec<PolicyBlockedVersion>>(payload)
+        {
+            push_blocked(entries, &mut blocked);
+            continue;
         }
         let policy = policy_blocked_versions(&failure.message);
         if !policy.is_empty() {
@@ -490,7 +490,9 @@ fn installed_package_version(profile: &Path, id: &str) -> Option<String> {
 /// 批量卸载：单次 `dsh plugin remove <id1> <id2> ...`，随后逐项核验 profile 清单，
 /// 仍被引用时走离线卸载兜底（第三方可卸载插件），最后级联清理各自的单插件快照。
 pub async fn remove_many(app_handle: &AppHandle, ids: &[String]) -> Result<(), String> {
+    let _operation = super::acquire_operation_lock().await?;
     let command_result = run_plugin_command(app_handle, ids, "remove", ids).await;
+    let _process = super::acquire_process_lock().await?;
     let mut failures = Vec::new();
     for id in ids {
         // `dsh plugin remove` 以子进程退出码为准，可能出现「命令成功但插件仍在」的
@@ -588,12 +590,12 @@ async fn run_plugin_command(
 
     cli::ensure_shims(app_handle)?;
 
-    let node = config::get_node_binary_path(app_handle);
+    let node = crate::service::workflow::electron_executable(app_handle)?;
     let dsh_bin = core::active_dsh_binary(app_handle);
     if !node.exists() {
         return Err("NODE_NOT_FOUND: Node.js runtime missing".to_string());
     }
-    if !dsh_bin.exists() {
+    if !config::core_entry_exists(&dsh_bin) {
         return Err("HARNESS_NOT_FOUND: dsh CLI missing".to_string());
     }
 
@@ -614,11 +616,19 @@ async fn run_plugin_command(
         }
     }
 
-    let envs = build_plugin_envs(app_handle, prefer_bundled_pnpm);
+    let envs = build_plugin_envs(app_handle, prefer_bundled_pnpm)?;
 
     let profile = active_profile(app_handle);
     let profile_path = crate::service::profile::profile_dir_of(app_handle, &profile);
-    let mut args = vec![dsh_bin.as_os_str().to_os_string()];
+    let mut args = Vec::new();
+    if config::asar_ancestor(&dsh_bin).is_some() {
+        args.extend([
+            OsString::from("--require"),
+            core::prepare_native_bridge(&cli::get_bin_dir(app_handle))?.into_os_string(),
+        ]);
+        args.extend(crate::service::profile::carrier_node_args(false));
+    }
+    args.push(dsh_bin.as_os_str().to_os_string());
     args.extend(single_plugin_args(&profile, action, sub_args));
 
     let cwd = crate::service::core::active_core_dir(app_handle);
@@ -714,10 +724,11 @@ async fn run_plugin_command(
             log::warn!("failed to clear plugin error for {id}: {e}");
         }
     }
-    if action == "remove" && ids.iter().any(|id| id == "dsh-win-terminal-inspector") {
-        if let Err(e) = workflow::win_inspector::apply(app_handle) {
-            log::warn!("win inspector patch prune failed after remove: {e}");
-        }
+    if action == "remove"
+        && ids.iter().any(|id| id == "dsh-win-terminal-inspector")
+        && let Err(e) = workflow::win_inspector::apply(app_handle)
+    {
+        log::warn!("win inspector patch prune failed after remove: {e}");
     }
     log::info!("dsh plugin {action} succeeded for {ids:?}");
     Ok(())
@@ -735,9 +746,9 @@ async fn run_plugin_command(
 ///    退出且**不打印任何说明**——实测 bundled pnpm 11.7.0 在 `^2.10.15` 上
 ///    `update --latest` 静默停在 2.10.15。用户授权该精确版本后，档案豁免让
 ///    解析与 lockfile 校验放行该版本。因此这条消息不能只归因于 catalog 钉死。
-/// 必须如实报「没升级」——报成功会让用户以为已在新版本上（与 [`remove_many`] 的
-/// 「卸载后核验」同理）；但**不**记进插件错误：插件没坏，记了会让列表挂上
-/// 「可能已损坏或与当前环境不兼容」的误导标记（安装/升级真失败各有记录点）。
+///    必须如实报「没升级」——报成功会让用户以为已在新版本上（与 [`remove_many`] 的
+///    「卸载后核验」同理）；但**不**记进插件错误：插件没坏，记了会让列表挂上
+///    「可能已损坏或与当前环境不兼容」的误导标记（安装/升级真失败各有记录点）。
 ///
 /// 入口核验与安装一致：git 托管插件升级后同样可能停在「prepare 未构建 → 声明
 /// 入口缺失」坏态，若不拦截，下一次启动即崩溃（见 [`ensure_plugin_entry_built`]）。
@@ -784,7 +795,7 @@ async fn verify_update_landed(
     };
     let window = crate::utils::operation_window(app_handle)
         .ok_or("WINDOW_NOT_FOUND: current profile window missing")?;
-    let envs = build_plugin_envs(app_handle, harness_prefer_bundled_pnpm(app_handle).await?);
+    let envs = build_plugin_envs(app_handle, harness_prefer_bundled_pnpm(app_handle).await?)?;
     let pkg_dir = profile_dir(app_handle).join("node_modules").join(name);
     if let Err(e) = ensure_plugin_entry_built(app_handle, id, &pkg_dir, &envs, &window).await {
         if let Err(err) = errors::record(app_handle, id, "update", &e) {
@@ -815,26 +826,23 @@ fn update_verify_step(
     let reached = expected.is_some_and(|expected| {
         installed_package_version(profile, id).as_deref() == Some(expected)
     });
-    if !reached {
-        if let Some(before) = before {
-            if dependency_fingerprint(profile, id).as_deref() == Some(before) {
-                let detail =
-                    installed_package_version(profile, id).unwrap_or_else(|| before.to_string());
-                // 目标版本优先用本次请求带来的版本（面板显示的那个），探测缓存只在没有时
-                // 兜底：缓存没命中会让 `latest` 为空，用户点升级就只剩一句「没有变化」。
-                let latest = expected
-                    .filter(|expected| *expected != detail && is_registry_version(expected))
-                    .map(str::to_string)
-                    .or_else(|| {
-                        known_latest()
-                            .filter(|latest| latest != &detail && is_registry_version(latest))
-                    });
-                log::warn!(
-                    "dsh plugin update made no change for {id}, still at {detail}, newest {latest:?}"
-                );
-                return UpdateVerifyStep::Hold { detail, latest };
-            }
-        }
+    if !reached
+        && let Some(before) = before
+        && dependency_fingerprint(profile, id).as_deref() == Some(before)
+    {
+        let detail = installed_package_version(profile, id).unwrap_or_else(|| before.to_string());
+        // 目标版本优先用本次请求带来的版本（面板显示的那个），探测缓存只在没有时
+        // 兜底：缓存没命中会让 `latest` 为空，用户点升级就只剩一句「没有变化」。
+        let latest = expected
+            .filter(|expected| *expected != detail && is_registry_version(expected))
+            .map(str::to_string)
+            .or_else(|| {
+                known_latest().filter(|latest| latest != &detail && is_registry_version(latest))
+            });
+        log::warn!(
+            "dsh plugin update made no change for {id}, still at {detail}, newest {latest:?}"
+        );
+        return UpdateVerifyStep::Hold { detail, latest };
     }
     UpdateVerifyStep::Entry
 }
@@ -1232,7 +1240,9 @@ mod tests {
         // git 依赖：插件不 bump version，只有 lock 里的 codeload 提交变化。
         // 指纹必须仍能识别（否则 git 插件的正常升级会被误报为假成功）。
         let lock = |sha: &str| {
-            format!("lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      dsh-probe:\n        specifier: 'catalog:'\n        version: https://codeload.github.com/o/r/tar.gz/{sha}\n")
+            format!(
+                "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      dsh-probe:\n        specifier: 'catalog:'\n        version: https://codeload.github.com/o/r/tar.gz/{sha}\n"
+            )
         };
         let before = probe_profile("git-before", &lock("aaaaaaaaaaaaaaaa"), Some("0.2.21"));
         let after = probe_profile("git-after", &lock("bbbbbbbbbbbbbbbb"), Some("0.2.21"));

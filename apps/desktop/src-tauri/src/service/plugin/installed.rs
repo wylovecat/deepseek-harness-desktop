@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use crate::AppHandle;
 
 use super::preset::{load_deprecated_ids, load_presets, PreinstallPluginInfo};
@@ -43,8 +43,8 @@ pub(crate) fn profile_dir(app_handle: &AppHandle) -> PathBuf {
 
 /// 已安装的插件 id 集合：通过强类型反序列化读取 package.json 的 `dependencies` 键与 `bundles` 列表。
 ///
-/// 供「插件是否已安装」的单点判定（[`is_installed`]）与安全模式的用户插件清除
-/// （[`super::safe`]）共用：后者需要的是全量清单，而非逐个 id 的探测。
+/// 供「插件是否已安装」的单点判定（[`is_installed`]）等需要的全量清单场景共用：
+/// 后者要的是整份清单，而非逐个 id 的探测。
 pub(crate) fn list_installed(app_handle: &AppHandle) -> HashSet<String> {
     declared_packages(app_handle).unwrap_or_default()
 }
@@ -55,15 +55,20 @@ pub(crate) fn list_installed(app_handle: &AppHandle) -> HashSet<String> {
 /// 删除类操作必须把后者当未知状态处理，否则一次解析失败会让所有已声明的包
 /// 变成「未声明」，进而被误删。
 pub(crate) fn declared_packages(app_handle: &AppHandle) -> Option<HashSet<String>> {
-    let manifest_path = profile_dir(app_handle).join("package.json");
+    declared_packages_at(&profile_dir(app_handle))
+}
+
+/// 指定档案目录声明的包名（纯路径版，供启动快路径与常规启动共用）。
+pub(crate) fn declared_packages_at(profile: &Path) -> Option<HashSet<String>> {
+    let manifest_path = profile.join("package.json");
     let content = std::fs::read_to_string(&manifest_path).ok()?;
     let manifest = serde_json::from_str::<ProfilePackageJson>(&content).ok()?;
 
     let mut set: HashSet<String> = manifest.dependencies.into_keys().collect();
-    if let Some(dsh) = manifest.dsh {
-        if let Some(profile) = dsh.profile {
-            set.extend(profile.bundles);
-        }
+    if let Some(dsh) = manifest.dsh
+        && let Some(profile) = dsh.profile
+    {
+        set.extend(profile.bundles);
     }
     Some(set)
 }
@@ -256,10 +261,10 @@ mod tests {
         let parsed: ProfilePackageJson = serde_json::from_str(&content).unwrap();
 
         let mut set: HashSet<String> = parsed.dependencies.into_keys().collect();
-        if let Some(dsh) = parsed.dsh {
-            if let Some(profile) = dsh.profile {
-                set.extend(profile.bundles);
-            }
+        if let Some(dsh) = parsed.dsh
+            && let Some(profile) = dsh.profile
+        {
+            set.extend(profile.bundles);
         }
 
         assert!(set.contains("dshmarket"));

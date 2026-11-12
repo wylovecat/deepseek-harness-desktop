@@ -3,11 +3,11 @@
 ## deepseek-ai/deepseek-harness
 
 - Repository: <https://github.com/deepseek-ai/deepseek-harness>
-- Reference version: `dsh-v0.2.1-rc.5`
-- Reference revision: `b830ec950faba0a46dda564be3e2d854afed94f1`
+- Reference version: `dsh-v0.2.2-rc.1`
+- Reference revision: `66491b05e3f05ad35bcdd4f6cd7ed26041d9e3db`
 - Previous documented reference: `dsh-v0.2.1-rc.1` (`1600d8a1e140dcde43a1a0941940a0480712c011`); alpha.1 (`5badb15009ae1756c3afe0ae0cef1faafc290ccc`) remains historical attribution. This release does not recopy or revalidate every derived file.
 - Source: `source/deepseek-harness`
-- Support policy: recommended core `0.2.1-rc.5`, minimum core `0.2.1-rc.1`; earlier cores are unsupported. Verification scope: [current compatibility record](<./docs/compatibility-0.2.1-rc.5.md>). Earlier version comparisons below are historical, not a current support promise.
+- Support policy: recommended core `0.2.2-rc.1`, minimum core `0.2.1-rc.1`; earlier cores are unsupported. Verification scope: [current compatibility record](<./docs/compatibility-0.2.2-rc.1.md>). Earlier version comparisons below are historical, not a current support promise.
 - License: MIT — Copyright (c) 2026 DeepSeek
 
 Derived (upstream → this package):
@@ -17,10 +17,6 @@ Derived (upstream → this package):
 - `apps/desktop/src/preload-app.ts` — `contextBridge.exposeInMainWorld('dshDesktop', <app origin> ? createProductApi() : { protocolVersion: 1 })` → `src/host/apply.ts`: the carrier marker; `protocolVersion: 1` plus `deviceInfo()` returning `navigator.userAgent` are published, no Electron product API (`browser`, `updates`) is faked.
 - `packages/host/webserver` — structured index-injection rows (`global`, `script`, `script-src`, …) → `src/host/types/harness.ts` (`IndexInjectRow`; upstream exports the same union as `IndexInjection`).
 - `apps/desktop/src/main.ts` — `app.setAsDefaultProtocolClient('dsh')` + `open-url` handling that focuses the primary window for `dsh://open` → `src-tauri/src/desktop/deep_link.rs` (app shell).
-
-Not derived:
-
-- `src/host/service/gate.ts` adapts this repo's embedded-WebView authentication constraints; upstream only defines the `connection` gate semantics it overrides.
 
 Note:
 

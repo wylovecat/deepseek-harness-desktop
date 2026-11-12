@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::status::Status;
@@ -15,17 +14,36 @@ struct Registry {
     instances: HashMap<String, Arc<Instance>>,
 }
 
+pub(super) type LaunchUrl = Arc<Mutex<Option<(u16, String)>>>;
+
 pub(super) struct Instance {
     pub process: Mutex<Option<super::process::OwnedProcess>>,
+    pub launch_url: Mutex<LaunchUrl>,
+    pub authenticated_host:
+        tokio::sync::Mutex<Option<(String, tauri_runtime_electron::AuthenticatedWebHost)>>,
     pub launching: Arc<std::sync::atomic::AtomicBool>,
     pub status: Mutex<Status>,
     pub port: Mutex<Option<u16>>,
+}
+
+impl Instance {
+    pub fn reset_launch_url(&self) {
+        *self
+            .launch_url
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Arc::default();
+        if let Ok(mut host) = self.authenticated_host.try_lock() {
+            *host = None;
+        }
+    }
 }
 
 impl Default for Instance {
     fn default() -> Self {
         Self {
             process: Mutex::new(None),
+            launch_url: Mutex::new(Arc::default()),
+            authenticated_host: tokio::sync::Mutex::new(None),
             launching: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             status: Mutex::new(Status::Initial),
             port: Mutex::new(None),
@@ -53,16 +71,6 @@ pub(super) fn begin_shutdown_at(gate: &Mutex<bool>) {
 
 pub fn current_profile() -> Option<String> {
     PROFILE.try_with(Clone::clone).ok()
-}
-
-static SAFE_MODE: AtomicBool = AtomicBool::new(false);
-
-pub fn safe_mode() -> bool {
-    SAFE_MODE.load(Ordering::Relaxed)
-}
-
-pub fn set_safe_mode(active: bool) {
-    SAFE_MODE.store(active, Ordering::Relaxed);
 }
 
 pub async fn scope<T>(profile: String, future: impl Future<Output = T>) -> T {
@@ -99,13 +107,14 @@ pub fn profiles() -> Vec<String> {
         .collect()
 }
 
-pub fn window_profile(app: &crate::AppHandle, label: &str) -> String {
-    let mut registry = registry().lock().unwrap_or_else(|error| error.into_inner());
-    registry
+pub fn window_profile<R: tauri::Runtime>(app: &crate::AppHandle<R>, label: &str) -> String {
+    let profile = registry()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
         .windows
-        .entry(label.to_string())
-        .or_insert_with(|| crate::service::profile::active_profile(app))
-        .clone()
+        .get(label)
+        .cloned();
+    profile.unwrap_or_else(|| crate::service::profile::active_profile(app))
 }
 
 pub fn window_uses_profile(label: &str, profile: &str) -> bool {
@@ -216,6 +225,23 @@ pub fn port<R: tauri::Runtime>(app: &crate::AppHandle<R>) -> u16 {
         .unwrap_or_else(|| crate::config::get_store_dat_setting(app).port)
 }
 
+/// 主窗口文档即 DSH 时，本机服务在 origin 层面的地址；其它窗口返回 `None`。
+pub fn dsh_service_origin(webview: &crate::Webview) -> Option<tauri::Url> {
+    use tauri::Manager;
+    if webview.label() != webview.window().label() {
+        return None;
+    }
+    let app = webview.app_handle();
+    let profile = registry()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .windows
+        .get(webview.window().label())
+        .cloned()?;
+    let port = scope_sync(profile, || port(app));
+    tauri::Url::parse(&crate::config::get_dsh_service_url(port)).ok()
+}
+
 pub fn set_port(port: u16) {
     *instance()
         .port
@@ -226,15 +252,6 @@ pub fn set_port(port: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn safe_mode_is_a_session_flag_and_never_a_persisted_profile() {
-        assert!(!safe_mode());
-        set_safe_mode(true);
-        assert!(safe_mode());
-        set_safe_mode(false);
-        assert!(!safe_mode());
-    }
 
     #[test]
     fn unscoped_instance_uses_desktop_default() {
@@ -282,9 +299,11 @@ mod tests {
             }),
             scope("concurrent-profile-b".into(), async {
                 tokio::task::yield_now().await;
-                assert!(!instance()
-                    .launching
-                    .load(std::sync::atomic::Ordering::SeqCst));
+                assert!(
+                    !instance()
+                        .launching
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                );
                 assert_eq!(current_profile().as_deref(), Some("concurrent-profile-b"));
                 instance()
             })

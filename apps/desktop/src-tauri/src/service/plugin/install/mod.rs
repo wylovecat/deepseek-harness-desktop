@@ -31,28 +31,27 @@
 //! - [`diagnose`]：失败输出解析（网络 / git 传输层 / ANSI 清洗与消息挑选）
 //! - [`artifact`]：安装产物落盘核验（防「假成功」）+ 声明入口就地补构建
 
-use crate::{AppHandle, Window};
-use crate::config;
 use crate::service::cli;
 use crate::service::core;
 use crate::service::profile::{
     active_profile, allow_profile_release_age, profile_dir_of, release_age_excludes_at,
 };
+use crate::{AppHandle, Window, config};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::Path;
-use tauri::{ Emitter};
+use tauri::Emitter;
 
 // plugin 兄弟模块的再导出：子模块经 `super::` 统一从这里取，跨模块边界只在此定义。
 pub(crate) use super::ensure_profile_npmrc;
 pub(crate) use super::errors;
 pub(crate) use super::installed::{installed_name, is_installed, profile_dir};
 pub(crate) use super::preset::{
-    bundled_dep_spec, bundled_plugin_dir, load_presets, PreinstallPluginInfo,
+    PreinstallPluginInfo, bundled_dep_spec, bundled_plugin_dir, load_presets,
 };
 pub(crate) use super::process::{
-    acquire_operation_lock, acquire_process_lock, new_process_owner, run_plugin_process, PidGuard,
-    PreinstallLogPayload, ProcessOwner, PREINSTALL_LOG_EVENT,
+    PREINSTALL_LOG_EVENT, PidGuard, PreinstallLogPayload, ProcessOwner, acquire_operation_lock,
+    acquire_process_lock, new_process_owner, run_plugin_process,
 };
 pub(crate) use super::recovery::is_actionable_plugin_ref;
 pub(crate) use super::uninstall_recovery;
@@ -77,6 +76,7 @@ pub(crate) use pnpm::{
 };
 pub use single::{remove_many, update_many};
 // 版本兼容性/发布时长两类拦截的解析结果都要跨到 `bridge`（前端逐项确认后授权），在此定义出口
+pub(crate) use diagnose::trust_policy_rejection;
 pub use diagnose::{IncompatibleVersion, PolicyBlockedVersion};
 
 use allowlist::{add_allow_build_keys, parse_allowlist_keys};
@@ -84,7 +84,7 @@ use artifact::{ensure_plugin_entry_built, verify_installed_products};
 use diagnose::{
     diagnostic_suffix, git_transport_hint, incompatible_versions, network_error_hint,
     pick_error_message, policy_blocked_versions, policy_verification_network_failure,
-    store_mismatch_hint,
+    release_age_policy_rejected, store_mismatch_hint,
 };
 use pnpm::ensure_pnpm;
 use single::single_plugin_args;
@@ -155,9 +155,10 @@ pub(crate) async fn install_internal(
     ids: &[String],
     cancel: tokio::sync::watch::Receiver<bool>,
     owner: ProcessOwner,
+    operation: &tokio::sync::OwnedMutexGuard<()>,
 ) -> Result<(), String> {
     let targets = preset_targets(app_handle, ids)?;
-    install_with_cancel(app_handle, &targets, Some(cancel), owner).await
+    install_with_guard(app_handle, &targets, Some(cancel), owner, operation).await
 }
 
 /// 按原始 spec 安装（插件市场 / 手动输入）：与预装路径共用同一套编排，只是目标
@@ -241,19 +242,18 @@ fn spec_targets(app_handle: &AppHandle, specs: &[String]) -> Result<Vec<InstallT
         if let Some(preset) = presets
             .iter()
             .find(|preset| preset.id == spec || preset.spec == spec)
-        {
-            if let Ok(raw) = preset_spec_for_install(
+            && let Ok(raw) = preset_spec_for_install(
                 preset,
                 bundled_dir_of(app_handle, preset),
                 core_version.as_deref(),
-            ) {
-                targets.push(InstallTarget {
-                    id: preset.id.clone(),
-                    name: Some(installed_name(preset).to_string()),
-                    spec: normalize_git_spec(&raw),
-                });
-                continue;
-            }
+            )
+        {
+            targets.push(InstallTarget {
+                id: preset.id.clone(),
+                name: Some(installed_name(preset).to_string()),
+                spec: normalize_git_spec(&raw),
+            });
+            continue;
         }
         let raw = normalize_git_spec(spec);
         let name = spec::package_name_of_spec(&raw, &base);
@@ -346,6 +346,17 @@ async fn install_with_cancel(
     cancel: Option<tokio::sync::watch::Receiver<bool>>,
     owner: ProcessOwner,
 ) -> Result<(), String> {
+    let operation = acquire_operation_lock().await?;
+    install_with_guard(app_handle, targets, cancel, owner, &operation).await
+}
+
+async fn install_with_guard(
+    app_handle: &AppHandle,
+    targets: &[InstallTarget],
+    cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    owner: ProcessOwner,
+    _operation: &tokio::sync::OwnedMutexGuard<()>,
+) -> Result<(), String> {
     if targets.is_empty() {
         return Err("PREINSTALL_EMPTY: no plugins selected".to_string());
     }
@@ -372,13 +383,13 @@ async fn install_with_cancel(
     // 确保 pnpm/dsh shim 存在
     cli::ensure_shims(app_handle)?;
 
-    let node = config::get_node_binary_path(app_handle);
+    let node = crate::service::workflow::electron_executable(app_handle)?;
     // 活动核心的 dsh 入口：本地核心存在时用本地 CLI，否则预打包
     let dsh_bin = core::active_dsh_binary(app_handle);
     if !node.exists() {
         return Err("NODE_NOT_FOUND: Node.js runtime missing".to_string());
     }
-    if !dsh_bin.exists() {
+    if !config::core_entry_exists(&dsh_bin) {
         return Err("HARNESS_NOT_FOUND: dsh CLI missing".to_string());
     }
 
@@ -403,18 +414,26 @@ async fn install_with_cancel(
         }
     }
 
-    let envs = build_plugin_envs(app_handle, prefer_bundled_pnpm);
+    let envs = build_plugin_envs(app_handle, prefer_bundled_pnpm)?;
 
     // 拼装命令行参数
     let profile = active_profile(app_handle);
     let profile_path = profile_dir_of(app_handle, &profile);
-    let mut args = vec![
+    let mut args = Vec::new();
+    if config::asar_ancestor(&dsh_bin).is_some() {
+        args.extend([
+            OsString::from("--require"),
+            core::prepare_native_bridge(&cli::get_bin_dir(app_handle))?.into_os_string(),
+        ]);
+        args.extend(crate::service::profile::carrier_node_args(false));
+    }
+    args.extend([
         dsh_bin.as_os_str().to_os_string(),
         OsString::from("plugin"),
         OsString::from("--profile"),
         OsString::from(&profile),
         OsString::from("add"),
-    ];
+    ]);
     args.extend(specs.iter().map(OsString::from));
 
     let cwd = crate::service::core::active_core_dir(app_handle);
@@ -478,6 +497,15 @@ async fn install_with_cancel(
                 .map_err(|e| format!("PREINSTALL_SERIALIZE: {e}"))?;
             return Err(format!("PLUGIN_VERSION_INCOMPATIBLE: {payload}"));
         }
+        // 信任策略拒绝：与发布时长门禁共用同一句标题，但说的是用户自己的依赖被降级。它必须
+        // 排在一切改写之前，且错误前缀刻意不进任何兜底分类，否则内置插件会把真实失败吞成
+        // 「安装成功」（见 [`trust_policy_rejection`]）。
+        if trust_policy_rejection(&last_attempt) {
+            log::warn!("pnpm trust policy rejected the profile lockfile");
+            return Err(format!(
+                "PREINSTALL_TRUST_POLICY: dsh plugin exited with code {exit_code} (pnpm trust policy rejected the lockfile)"
+            ));
+        }
         // 真实的发布时长策略违规：档案已经声明/装了太新的版本，pnpm 的 lockfile 校验
         // 不放行，于是**每一次**插件操作都会在这里失败。它不是安装故障，也不是网络问题
         // （发布时间都拿到了），重试毫无意义——解析成精确 `包名@版本` 交给前端，由用户
@@ -491,6 +519,22 @@ async fn install_with_cancel(
             let payload = serde_json::to_string(&policy_blocked)
                 .map_err(|e| format!("PREINSTALL_SERIALIZE: {e}"))?;
             return Err(format!("PLUGIN_POLICY_BLOCKED: {payload}"));
+        }
+        // 解析不出精确条目（pnpm 文案改版、违规条目来自用户自己的依赖）时，策略标记可能被
+        // `pick_error_message` 的 8 行截断丢掉，内置插件就再也进不了离线兜底（#1348）。
+        // 按**原始输出**先做一次稳定分类，把标题显式写进错误里。
+        //
+        // 拉取元数据失败时 pnpm 会把条目直接判成违规，那种是网络问题（见
+        // [`policy_verification_network_failure`]），要留给下面的网络分类去重试。
+        if release_age_policy_rejected(&last_attempt)
+            && !policy_verification_network_failure(&last_attempt)
+        {
+            log::warn!(
+                "pnpm release-age policy rejected the profile lockfile without parseable entries"
+            );
+            return Err(format!(
+                "PREINSTALL_FAILED: dsh plugin exited with code {exit_code} (lockfile failed supply-chain policy check; minimumReleaseAge)"
+            ));
         }
         // 区分 git 传输层失败与 allowBuilds 构建门禁：前者是 pnpm 走了 git+ssh
         // （用户环境无 SSH 配置），后者才是补充白名单可自愈的。传输层错误给出
@@ -630,26 +674,35 @@ pub async fn allow_version_exemptions(
     if versions.is_empty() {
         return Err("PLUGIN_EXEMPTION_EMPTY: no plugin version exemption to grant".to_string());
     }
+    let _operation = acquire_operation_lock().await?;
     let window = crate::utils::operation_window(app_handle)
         .ok_or("WINDOW_NOT_FOUND: current profile window missing")?;
-    let node = config::get_node_binary_path(app_handle);
+    let node = crate::service::workflow::electron_executable(app_handle)?;
     let dsh_bin = core::active_dsh_binary(app_handle);
     if !node.exists() {
         return Err("NODE_NOT_FOUND: Node.js runtime missing".to_string());
     }
-    if !dsh_bin.exists() {
+    if !config::core_entry_exists(&dsh_bin) {
         return Err("HARNESS_NOT_FOUND: dsh CLI missing".to_string());
     }
 
     // 豁免分支不进 pnpm（见函数文档），这里不做 pnpm 就绪探测：探测失败不该
     // 让一条本不需要 pnpm 的授权落不了地。
-    let envs = build_plugin_envs(app_handle, false);
+    let envs = build_plugin_envs(app_handle, false)?;
     let cwd = crate::service::core::active_core_dir(app_handle);
     let profile = active_profile(app_handle);
     let owner = new_process_owner();
     let mut failures: Vec<String> = Vec::new();
     for entry in versions {
-        let mut args = vec![dsh_bin.as_os_str().to_os_string()];
+        let mut args = Vec::new();
+        if config::asar_ancestor(&dsh_bin).is_some() {
+            args.extend([
+                OsString::from("--require"),
+                core::prepare_native_bridge(&cli::get_bin_dir(app_handle))?.into_os_string(),
+            ]);
+            args.extend(crate::service::profile::carrier_node_args(false));
+        }
+        args.push(dsh_bin.as_os_str().to_os_string());
         args.extend(single_plugin_args(
             &profile,
             "allow-version",
@@ -692,11 +745,12 @@ pub async fn allow_version_exemptions(
     }
 }
 
-pub fn allow_policy_versions(
+pub async fn allow_policy_versions(
     app_handle: &AppHandle,
     versions: &[PolicyBlockedVersion],
     expected_profile: Option<&str>,
 ) -> Result<(), String> {
+    let _operation = acquire_operation_lock().await?;
     let entries: Vec<String> = versions
         .iter()
         .map(|entry| format!("{}@{}", entry.name, entry.version))
@@ -722,7 +776,6 @@ async fn run_plugin_with_allow_build_retry(
     cancel: Option<&tokio::sync::watch::Receiver<bool>>,
     owner: ProcessOwner,
 ) -> Result<(i32, String, String), String> {
-    let _operation_guard = acquire_operation_lock().await;
     // 上一次被强杀的安装（取消 / 刷新 / 退出）会在 profile 里留下 dsh 的孤儿写锁，
     // 之后每次安装都要静默等到 deadline。dsh 侧不做恢复，这里按 PID 存活代劳。
     super::process::clear_orphan_plugin_writer_lock(&super::installed::profile_dir(app_handle));
@@ -1072,7 +1125,7 @@ mod tests {
         };
 
         assert_eq!(
-            locked_release_age_exemptions(&dir, &[locked.clone()]),
+            locked_release_age_exemptions(&dir, std::slice::from_ref(&locked)),
             Some(vec!["dshmarket@2.12.0".to_string()])
         );
         let transitive = PolicyBlockedVersion {

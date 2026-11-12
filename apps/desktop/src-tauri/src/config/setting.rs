@@ -71,28 +71,16 @@ pub struct Setting {
     /// 备份是否包含凭据文件（`.credentials.yaml`）。
     #[serde(default)]
     pub backup_include_credentials: bool,
-    /// 桌宠能力是否永久启用；临时隐藏不能改动此字段。
-    #[serde(default)]
-    pub pet_enabled: bool,
-    /// 当前选中的桌宠模型包（预设 id，或 `chat:` / `codex:` 来源限定 id）；
-    /// `None` = 从未选择，对外回落清单里的第一只预设宠物；空串 = 用户显式取消选择。
-    #[serde(default)]
-    pub active_pet: Option<String>,
-    /// 桌宠精灵图的显示宽度（逻辑像素）；`None` = 沿用窗口侧默认值。
-    #[serde(default)]
-    pub pet_size: Option<f64>,
-    /// 是否允许抛射桌宠（拖拽甩出后带速度飞行、撞到屏幕边缘回弹）。
-    ///
-    /// 默认关闭：飞行/回弹会打断「把宠物拖到某处」这一主要用途（issue #930），
-    /// 需要该效果的用户显式开启。拖拽本身不受此字段影响。
-    #[serde(default)]
-    pub throw_enabled: bool,
     #[serde(default)]
     pub force_xwayland: bool,
     /// 本地插件热重载：把已挂载的本地路径插件源码目录交给核心 HMR 监听，
     /// 源码改动即时生效（无需重启服务）。没有本地插件时不产生任何补丁层。
     #[serde(default = "default_local_plugin_hmr")]
     pub local_plugin_hmr: bool,
+    /// 核心引擎的发行格式：开启时下载并以 asar 归档运行，关闭时改用解压后的目录核心。
+    /// 只决定下载哪种资产；磁盘上实际是哪一种以文件为准（见 config::dependencies::binary_path_at）。
+    #[serde(default = "default_core_asar")]
+    pub core_asar: bool,
 }
 
 pub const ZOOM_FACTOR_MIN: f64 = 0.5;
@@ -140,6 +128,11 @@ pub fn default_backup_retention_count() -> u32 {
 /// 本地插件热重载默认开启：只有确实装了本地路径插件时才会产生监听目录，
 /// 未使用该能力的用户完全不受影响。
 pub fn default_local_plugin_hmr() -> bool {
+    true
+}
+
+/// 核心引擎默认以 asar 归档分发：归档体积更小、解压更快，也是既有的安装形态。
+pub fn default_core_asar() -> bool {
     true
 }
 
@@ -214,12 +207,9 @@ impl Default for Setting {
             close_action: default_close_action(),
             backup_retention_count: default_backup_retention_count(),
             backup_include_credentials: false,
-            pet_enabled: false,
-            active_pet: None,
-            pet_size: None,
-            throw_enabled: false,
             force_xwayland: false,
             local_plugin_hmr: default_local_plugin_hmr(),
+            core_asar: default_core_asar(),
         }
     }
 }
@@ -292,11 +282,6 @@ pub(crate) fn detect_first_install_at(app_data: Option<&std::path::Path>) -> boo
         .get_or_init(|| app_data.is_some_and(|dir| !dir.join(store_dat_file_name()).exists()))
 }
 
-/// 读取首装检测结果；尚未检测（或检测失败）时返回 `false`，保守按老用户处理。
-pub fn is_first_install() -> bool {
-    FIRST_INSTALL.get().copied().unwrap_or(false)
-}
-
 pub(crate) fn unwrap_json_value(
     value: &serde_json::Value,
 ) -> std::borrow::Cow<'_, serde_json::Value> {
@@ -351,16 +336,13 @@ fn preserve_persisted_fields(mut replacement: Setting, current: &Setting) -> Set
     replacement.harness_max_heap_mb = normalize_harness_max_heap_mb(current.harness_max_heap_mb);
     replacement.close_action = normalize_close_action(&current.close_action);
     replacement.auto_update = current.auto_update;
-    replacement.pet_enabled = current.pet_enabled;
-    replacement.active_pet.clone_from(&current.active_pet);
-    replacement.pet_size = current.pet_size;
-    replacement.throw_enabled = current.throw_enabled;
     replacement.force_xwayland = current.force_xwayland;
     replacement.local_plugin_hmr = current.local_plugin_hmr;
+    replacement.core_asar = current.core_asar;
     replacement
 }
 
-/// 兼容旧调用方的整对象写入，但始终保留锁内读到的最新缩放、关窗动作、桌宠与本地
+/// 兼容旧调用方的整对象写入，但始终保留锁内读到的最新缩放、关窗动作与本地
 /// 插件热重载等持久字段，避免长流程用陈旧 `Setting` 覆盖精确更新路径刚写入的值（丢更新）。
 pub fn set_store_dat_setting<R: Runtime>(app_handle: &AppHandle<R>, mut setting: Setting) {
     let value = {
@@ -656,7 +638,6 @@ mod tests {
                     close_action: "quit".to_string(),
                     backup_retention_count: retention,
                     backup_include_credentials: true,
-                    active_pet: Some(String::new()),
                     ..Default::default()
                 };
                 normalize_setting(&mut setting);
@@ -667,7 +648,6 @@ mod tests {
                 assert_eq!(setting.language, "custom-language");
                 assert_eq!(setting.port, 4099);
                 assert!(setting.backup_include_credentials);
-                assert_eq!(setting.active_pet.as_deref(), Some(""));
             }
         }
         for heap_mb in [0, 1023, 32769, u32::MAX] {
@@ -706,6 +686,31 @@ mod tests {
         assert!(
             !merged.auto_update,
             "整对象写入不得把用户显式关闭的自动更新翻回开启"
+        );
+    }
+
+    #[test]
+    fn core_asar_defaults_on_and_survives_stale_full_writes() {
+        let legacy: Setting = serde_json::from_value(serde_json::json!({
+            "installed": true,
+            "port": 3080,
+            "auto_start": true,
+            "language": "zh-CN"
+        }))
+        .expect("legacy setting should deserialize");
+        assert!(
+            legacy.core_asar,
+            "旧配置缺失 core_asar 时应回落默认的 asar 核心，不能把老用户静默切到目录核心"
+        );
+
+        let current = Setting {
+            core_asar: false,
+            ..Default::default()
+        };
+        let merged = preserve_persisted_fields(Setting::default(), &current);
+        assert!(
+            !merged.core_asar,
+            "整对象写入不得把用户显式关闭的 ASAR 开关翻回开启"
         );
     }
 
@@ -749,10 +754,6 @@ mod tests {
             zoom_factor: 0.8,
             close_action: "quit".to_string(),
             auto_update: false,
-            pet_enabled: false,
-            active_pet: Some("chat:stale".to_string()),
-            pet_size: Some(80.0),
-            throw_enabled: false,
             local_plugin_hmr: false,
             ..Default::default()
         };
@@ -770,10 +771,6 @@ mod tests {
             harness_max_heap_mb: Some(4096),
             zoom_factor: 1.6,
             close_action: "tray".to_string(),
-            pet_enabled: true,
-            active_pet: Some("codex:latest".to_string()),
-            pet_size: Some(140.0),
-            throw_enabled: true,
             local_plugin_hmr: true,
             ..Default::default()
         };
@@ -792,14 +789,6 @@ mod tests {
         assert_eq!(merged.appearance, current.appearance);
         assert_eq!(merged.close_action, "tray");
         assert!(merged.auto_update, "整对象写入不得覆盖最新的自动更新开关");
-        assert!(merged.pet_enabled);
-        assert_eq!(merged.active_pet.as_deref(), Some("codex:latest"));
-        assert_eq!(
-            merged.pet_size,
-            Some(140.0),
-            "整对象写入不得覆盖最新桌宠字段"
-        );
-        assert!(merged.throw_enabled, "整对象写入不得覆盖最新的抛射开关");
         assert!(
             merged.local_plugin_hmr,
             "整对象写入不得覆盖最新的本地插件热重载开关"
@@ -807,20 +796,20 @@ mod tests {
     }
 
     #[test]
-    fn wholesale_setting_writes_cannot_pin_the_safe_profile_as_startup_profile() {
+    fn wholesale_setting_writes_cannot_override_the_startup_profile() {
         let current = Setting {
             active_profile: "custom".into(),
             ..Default::default()
         };
         let stale = Setting {
-            active_profile: "safe".into(),
+            active_profile: "other".into(),
             language: "en-US".into(),
             ..Default::default()
         };
         let merged = preserve_persisted_fields(stale, &current);
         assert_eq!(
             merged.active_profile, "custom",
-            "安全模式是临时档案，整对象写入不得把它落成下次启动档案"
+            "整对象写入不得覆盖精确更新路径刚写入的启动档案"
         );
         assert_eq!(merged.language, "en-US");
     }
@@ -936,19 +925,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pet_defaults_closed_and_legacy_enabled_value_survives() {
-        assert!(!Setting::default().pet_enabled, "新安装必须默认关闭桌宠");
-
-        let legacy: Setting = serde_json::from_value(serde_json::json!({
-            "installed": true,
-            "port": 3080,
-            "auto_start": true,
-            "language": "zh-CN",
-            "pet_enabled": true,
-            "pet_visible": false
-        }))
-        .expect("legacy setting should deserialize");
-        assert!(legacy.pet_enabled, "旧版临时隐藏字段不得关闭永久启用状态");
-    }
 }

@@ -7,6 +7,7 @@ use crate::config;
 use crate::service::cli;
 use crate::service::update;
 use crate::AppHandle;
+use tauri::Manager;
 
 /// 当前桌面端配置
 #[tauri::command]
@@ -76,10 +77,10 @@ pub async fn update_app_config(
         .as_deref()
         .map(config::proxy::normalize_proxy_url)
         .transpose()?;
-    if let Some(port) = port {
-        if port == 0 {
-            return Err("port must be a positive number".to_string());
-        }
+    if let Some(port) = port
+        && port == 0
+    {
+        return Err("port must be a positive number".to_string());
     }
     // 命令行集成：先执行文件系统/PATH 操作，成功后再持久化开关，
     // 失败时配置保持不变，避免"开关已开但 shim 未生成"的不一致状态。
@@ -128,6 +129,13 @@ pub async fn update_app_config(
             setting.backup_include_credentials = include;
         }
     });
+    if zoom_factor.is_some() {
+        for (label, window) in app_handle.webview_windows() {
+            if let Err(error) = crate::desktop::zoom::apply_native_zoom(&window, setting.zoom_factor) {
+                log::warn!("[zoom] window zoom was not applied ({label}): {error}");
+            }
+        }
+    }
     // 关闭自动更新时立刻丢弃已下载的待安装包：否则用户退出前又打开开关，旧的
     // 安装包会在退出时被直接拉起安装（见 service::update::clear_pending_installer）。
     if auto_update == Some(false) {
@@ -197,4 +205,22 @@ pub async fn test_proxy(app_handle: AppHandle) -> Result<config::proxy::ProxyTes
 #[tauri::command]
 pub fn get_dsh_theme(app_handle: AppHandle) -> config::DshTheme {
     config::get_dsh_theme(&app_handle)
+}
+
+/// Linux 下是否强制 Electron 走 X11（Wayland 下透明置顶窗口不可用）
+#[tauri::command]
+pub fn get_force_xwayland(app: AppHandle) -> bool {
+    cfg!(target_os = "linux") && config::get_store_dat_setting(&app).force_xwayland
+}
+
+/// 切换强制 X11 开关（仅 Linux 支持）
+#[tauri::command]
+pub fn set_force_xwayland(app: AppHandle, enabled: bool) -> Result<bool, String> {
+    if !cfg!(target_os = "linux") {
+        return Err("FORCE_XWAYLAND_UNSUPPORTED: only Linux supports Electron X11 mode".into());
+    }
+    Ok(config::update_store_dat_setting(&app, |setting| {
+        setting.force_xwayland = enabled;
+    })
+    .force_xwayland)
 }

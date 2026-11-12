@@ -13,11 +13,11 @@ use std::sync::{Arc, OnceLock};
 use tauri::Manager;
 
 #[cfg(unix)]
-use super::process::warn_if_inotify_watch_limit_low;
+use super::process::{signal_exit_code, warn_if_inotify_watch_limit_low};
 use super::process::{
-    has_owned_process, launch_guard, on_owned_process_exit_at, register_owned_process, stop,
-    take_startup_sweep, terminate_stale_harness_processes, LaunchGuard, OwnedProcess,
-    HARNESS_PROCESS_EXITED_EVENT,
+    HARNESS_PROCESS_EXITED_EVENT, LaunchGuard, OwnedProcess, has_owned_process, launch_guard,
+    on_owned_process_exit_at, register_owned_process, stop, take_startup_sweep,
+    terminate_stale_harness_processes,
 };
 use super::status;
 #[cfg(windows)]
@@ -33,7 +33,6 @@ type HarnessChild = std::process::Child;
 pub(super) struct LaunchPlan {
     pub(super) setting: config::Setting,
     pub(super) profile: String,
-    pub(super) node: PathBuf,
     pub(super) dsh_binary: PathBuf,
     pub(super) core_dir: PathBuf,
     pub(super) profile_root: PathBuf,
@@ -46,35 +45,14 @@ pub(super) struct LaunchPlan {
     pub(super) resources: Option<PathBuf>,
     pub(super) git_dir: Option<PathBuf>,
     pub(super) user_pnpm: Option<PathBuf>,
+    /// 本次启动的活动核心版本；内置插件补丁层按它决定默认启停。
+    pub(super) core_version: Option<String>,
 }
 
 /// 端口释放等待上限：刚结束/清扫过上个会话的残留 dsh 进程后，TCP 端口释放
 /// 存在短暂滞后（taskkill 返回 ≠ 端口已可复用）。等待窗口内端口回落为空闲则
 /// 复用配置端口；到期仍未释放才按“真占用”逐级递增。
 const PORT_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
-
-#[cfg(target_os = "linux")]
-fn harness_library_path(
-    appdir: Option<&std::ffi::OsStr>,
-    library_path: Option<&std::ffi::OsStr>,
-) -> Option<OsString> {
-    use std::os::unix::ffi::OsStrExt;
-
-    let library_path = library_path?;
-    let Some(appdir) = appdir.filter(|path| !path.is_empty()) else {
-        return Some(library_path.to_os_string());
-    };
-    Some(
-        std::env::join_paths(
-            library_path
-                .as_bytes()
-                .split(|byte| matches!(*byte, b':' | b';'))
-                .map(|path| Path::new(std::ffi::OsStr::from_bytes(path)))
-                .filter(|path| !path.starts_with(Path::new(appdir))),
-        )
-        .expect("split Linux library paths contain no path separator"),
-    )
-}
 
 fn fatal_report_path(log_path: &Path) -> PathBuf {
     static NEXT_REPORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -116,8 +94,12 @@ fn build_harness_args(
         directory,
         filename,
     ]);
-    if profile == crate::service::profile::DESKTOP_PROFILE {
-        args.extend(crate::service::profile::carrier_node_args(true));
+    if profile == crate::service::profile::DESKTOP_PROFILE
+        || config::asar_ancestor(dsh_binary).is_some()
+    {
+        args.extend(crate::service::profile::carrier_node_args(
+            profile == crate::service::profile::DESKTOP_PROFILE,
+        ));
     }
     args.extend([
         dsh_binary.as_os_str().to_os_string(),
@@ -200,9 +182,7 @@ fn resolve_heal_port(configured: u16, heal_target: u16, heal_target_free: bool) 
 
 /// 检测并启动 Harness 服务
 pub async fn start(app_handle: crate::AppHandle) -> Result<(), String> {
-    super::early::wait_preparation().await?;
     let setting = config::get_store_dat_setting(&app_handle);
-    let node_binary_path = config::get_node_binary_path(&app_handle);
     // 活动核心的入口：本地核心存在时优先本地（需求 3），否则预打包
     let dsh_binary_path = crate::service::core::active_dsh_binary(&app_handle);
 
@@ -210,7 +190,7 @@ pub async fn start(app_handle: crate::AppHandle) -> Result<(), String> {
         log::debug!("Harness not installed, skipping startup");
         return Ok(());
     }
-    if !node_binary_path.exists() || !dsh_binary_path.exists() {
+    if !config::core_entry_exists(&dsh_binary_path) {
         // Windows RedirectionGuard(448)：安装器继承的强制执行上下文永不自行恢复，
         // 先尝试通过 explorer 逃逸重拉（见 relaunch_via_shell_escape 注释），
         // 成功则本进程退出；未命中（重拉未逃逸/非 448）才走常规缺失处理。
@@ -295,7 +275,7 @@ fn wait_harness(
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
         use windows_sys::Win32::System::Threading::{
-            GetExitCodeProcess, WaitForSingleObject, INFINITE,
+            GetExitCodeProcess, INFINITE, WaitForSingleObject,
         };
 
         let handle = child.as_raw_handle();
@@ -317,16 +297,26 @@ fn wait_harness(
     }
     #[cfg(unix)]
     {
+        use std::os::unix::process::ExitStatusExt;
+
+        // issue #1490：Unix 被信号终止时 ExitStatus::code() 为空，改用负信号号上报，
+        // 让退出日志写出 "terminated by SIGSEGV"；退出载荷仍是空退出码。
+        fn exit_code(exit: std::process::ExitStatus) -> Option<i64> {
+            exit.code()
+                .map(i64::from)
+                .or_else(|| exit.signal().map(signal_exit_code))
+        }
+
         let Some(timeout) = timeout else {
             return child
                 .wait()
-                .map(|exit| Some(exit.code().map(i64::from)))
+                .map(|exit| Some(exit_code(exit)))
                 .map_err(|error| format!("PROCESS_WAIT_FAILED: {error}"));
         };
         let deadline = std::time::Instant::now() + timeout;
         loop {
             match child.try_wait() {
-                Ok(Some(exit)) => return Ok(Some(exit.code().map(i64::from))),
+                Ok(Some(exit)) => return Ok(Some(exit_code(exit))),
                 Ok(None) if std::time::Instant::now() >= deadline => return Ok(None),
                 Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
                 Err(error) => return Err(format!("PROCESS_WAIT_FAILED: {error}")),
@@ -335,6 +325,10 @@ fn wait_harness(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "supervision needs the exit sink, log target, readiness sender, guards, and four injected steps"
+)]
 fn supervise_harness(
     mut on_exit: impl FnMut(u32, Option<i64>, Option<&Path>),
     log_path: &PathBuf,
@@ -352,6 +346,10 @@ fn supervise_harness(
     >,
     mut reset: impl FnMut(),
     mut persist: impl FnMut(u32),
+    mut probe: impl FnMut(
+        &mut HarnessChild,
+        Option<std::time::Duration>,
+    ) -> Result<Option<Option<i64>>, String>,
 ) -> Result<(), String> {
     let mut guards = Some(guards);
     let mut previous_exit = None;
@@ -421,7 +419,7 @@ fn supervise_harness(
             let _ = started.send(Ok(()));
         }
         let mut wait = |timeout| {
-            let result = wait_harness(&mut child, timeout);
+            let result = probe(&mut child, timeout);
             if let Err(error) = &result {
                 log::error!(
                     "{error}; terminating this Harness process before releasing its monitor"
@@ -479,7 +477,6 @@ fn supervise_harness(
 
 /// 启动 Harness 服务进程
 pub async fn launch(app_handle: crate::AppHandle) -> Result<(), String> {
-    super::early::wait_preparation().await?;
     // 启动分段计时（issue #766）：只写日志，不改控制流。每段一行 `STARTUP_PHASE`，
     // `ms` 是本段耗时、`total` 是本次 launch 的累计耗时。启动慢的归因过去只能靠
     // 时间戳猜测（同一进程内 auto_start 与前端 invoke 并发交错），埋点后可直接
@@ -499,7 +496,6 @@ pub async fn launch(app_handle: crate::AppHandle) -> Result<(), String> {
     };
     let mut setting = config::get_store_dat_setting(&app_handle);
     setting.port = super::instances::port(&app_handle);
-    let node_binary_path = config::get_node_binary_path(&app_handle);
     let transition = super::process::acquire_core_transition();
     tokio::pin!(transition);
     let _transition_guard = loop {
@@ -513,13 +509,9 @@ pub async fn launch(app_handle: crate::AppHandle) -> Result<(), String> {
     };
     let dsh_binary_path = crate::service::core::active_dsh_binary(&app_handle);
 
-    log::debug!("Checking Node.js path: {:?}", node_binary_path);
-    if !node_binary_path.exists() {
-        log::error!("Node.js not installed");
-        return Err("NODE_NOT_FOUND: Node.js not installed".to_string());
-    }
     log::debug!("Checking Harness path: {:?}", dsh_binary_path);
-    if !dsh_binary_path.exists() {
+    // 托管核心是 asar 归档，入口在归档内部：std::fs 看不到它，只能按归档判定。
+    if !config::core_entry_exists(&dsh_binary_path) {
         log::error!("Harness not installed");
         return Err("HARNESS_NOT_FOUND: Harness not installed".to_string());
     }
@@ -528,10 +520,11 @@ pub async fn launch(app_handle: crate::AppHandle) -> Result<(), String> {
         let tag = (config::dependencies::bundled_core_dir(&app_handle).as_ref() != Some(&core_dir))
             .then(|| config::get_dsh_pkg_tag(&app_handle))
             .flatten();
+        let baseline = config::manifest::minimum_dsh_version(&app_handle);
         crate::service::core::ensure_app_core_supported(
             &core_dir,
             tag.as_deref(),
-            config::manifest::minimum_dsh_version(&app_handle).as_deref(),
+            baseline.as_deref(),
         )?;
     }
     mark_phase("resolve", &mut phase_started);
@@ -653,8 +646,8 @@ pub async fn launch(app_handle: crate::AppHandle) -> Result<(), String> {
     let dsh_home = config::get_dsh_data_path(&app_handle);
     crate::service::perm::ensure_dir_writable(&dsh_home, "DSH_HOME_MKDIR_FAILED")?;
     // 当前档案目录同样必须在 spawn 前可写：`$DSH_HOME` 可写不代表档案可写——属主
-    // 错位可能只落在 `profiles` 或 `profiles/<id>` 上（安全模式要新建 `profiles/safe`，
-    // 因此 `profiles` 不可写同样是致命状态）。
+    // 错位可能只落在 `profiles` 或 `profiles/<id>` 上（新建档案要写 `profiles`，
+    // 因此父目录不可写同样是致命状态）。
     //
     // 先确保默认档案目录存在（幂等）：desktop::setup 的引导若失败（磁盘/权限抖动）
     // 或本进程没进过 setup，这里兜底。最佳努力：失败只告警，不阻断启动。
@@ -680,16 +673,6 @@ pub async fn launch(app_handle: crate::AppHandle) -> Result<(), String> {
         log::warn!("ensure active profile core bundles failed: {e}");
     }
 
-    // 安全模式：安全档案的契约是「只加载 web 模板核心 bundles、不带任何用户插件」，
-    // 但档案目录一旦存在就绝不重建（用户可能反复进出安全模式），而内置插件自愈与
-    // 首次引导安装都作用于「当时的活动档案」，于是安全档案里会累积用户插件——它们
-    // 往往正是启动失败的元凶，不清干净的话每次进入安全模式都带着同一批插件重启，
-    // 隔离形同虚设。必须在 spawn dsh 之前做（服务未运行时改清单、删 node_modules
-    // 目录才安全）。内置插件与核心包由被调方保留；非安全档案直接跳过。最佳努力：
-    // 失败只告警，不阻断启动（清理不彻底只是隔离效果打折，启动阻塞则让应用彻底不可用）。
-    if let Err(e) = crate::service::plugin::purge_user_plugins_in_safe_profile(&app_handle) {
-        log::warn!("safe mode user plugin purge failed: {e}");
-    }
     mark_phase("profile_prepare", &mut phase_started);
 
     // Linux 起步前探测 inotify 监视上限：harness 服务（dsh web）用 chokidar 递归
@@ -704,80 +687,18 @@ pub async fn launch(app_handle: crate::AppHandle) -> Result<(), String> {
     if let Err(e) = win_inspector::apply(&app_handle) {
         log::warn!("win32 legacy patch cleanup failed: {e}");
     }
-    // renderer 的 SlotOutlet 一行导出补丁（dsh-tauri-ui 设置侧边栏依赖）：只补
-    // 活动核心的 dsh-client-ui-renderer lib/client.js，已含导出即跳过（幂等；核心
-    // 换版本后自动重打，上游官方导出后自动退休）。最佳努力：失败只告警，不阻断
-    // 启动——未打补丁时插件侧降级，官方设置 dialog 照常工作，绝不白屏。
-    if let Err(e) = crate::service::patch::renderer::apply(&app_handle) {
-        log::warn!("renderer SlotOutlet patch failed: {e}");
-    }
-    // composer 可用性：官方 ConversationRoot 对「不属于任何工作区的空白会话」把
-    // composer 换成「选择工作区」触发器（`inert` 只看 chipTitle，而 chipTitle 只来自
-    // 工作区），于是 dsh-tauri-ui 的「未分组」新会话无法输入。补丁放宽该判定（会话已有
-    // cwd 即不算 inert）并写入 `data-dsh-composer-cwd` 能力标记；标记缺失时插件侧按
-    // 退级策略禁用「未分组」入口并告警。最佳努力且幂等：锚点缺失安全跳过。
-    if let Err(e) = crate::service::patch::composer::apply(&app_handle) {
-        log::warn!("composer workspace-less patch failed: {e}");
-    }
-    if let Err(e) = crate::service::patch::permission_settings::apply(&app_handle) {
-        log::warn!("permission settings error patch failed: {e}");
-    }
-    if let Err(e) = crate::service::patch::scroll_follow::apply(&app_handle) {
-        log::warn!("Scroll follow reduced-motion patch skipped: {e}");
-    }
-    if let Err(e) = crate::service::patch::mobile_composer::apply(&app_handle) {
-        log::warn!("mobile composer patch failed: {e}");
-    }
-    if let Err(e) = crate::service::patch::mobile_sidebar::apply(&app_handle) {
-        log::warn!("mobile sidebar patch failed: {e}");
-    }
-    // Expose an id-based SessionStore.remove facade so plugins can perform a
-    // real in-memory teardown instead of leaving deleted sessions ungrouped.
-    if let Err(e) = crate::service::patch::session::apply(&app_handle) {
-        log::warn!("SessionStore.remove patch failed: {e}");
-    }
-    // OpenCode Go 需要稳定的会话 ID 头，否则返回 400 MissingSessionID；上游 pi-ai
-    // 适配器把 sessionId 只透传给 SDK、不落成请求头，这里补上原生会话头，并限定到
-    // OpenCode 路由（provider id 前缀或生效 baseUrl 主机为 opencode.ai），其它 provider
-    // 的请求头保持不变。最佳努力且幂等：目标已含标记或锚点缺失时 patch_dsh 安全跳过。
-    if let Err(e) = crate::service::patch::llm_session::apply(&app_handle) {
-        log::warn!("pi-ai session header patch failed: {e}");
-    }
-    // Codex 系端点把思维链写在正文里（`<thinking>…</thinking>`），pi-ai 的
-    // openai-completions 适配器只认识结构化推理字段，思考便混进回答正文。补丁在
-    // 消息开头的围栏处把这段文本改道到 thinking 事件，harness 侧按 reasoning 块落库。
-    // 最佳努力且幂等：目标已含标记或锚点缺失时 patch_dsh 安全跳过。
-    if let Err(e) = crate::service::patch::pi_ai_thinking::apply(&app_handle) {
-        log::warn!("pi-ai thinking-as-text patch failed: {e}");
-    }
-    if let Err(e) = crate::service::patch::workspace::apply(&app_handle) {
-        log::warn!("workspace worktree membership patch failed: {e}");
-    }
-    if let Err(e) = crate::service::patch::workspace_view::apply(&app_handle) {
-        log::warn!("workspace view state patch failed: {e}");
-    }
-    // 上游 todo 投影只在 turn/start 清空、turn/end 不收敛，长回合里模型又倾向于把清单
-    // 一次性写完，于是「任务」面板长期停在「第一项进行中」。补丁让 turn/end 把残留的
-    // in_progress 降级为 pending，并把「完成即刻标记、逐项推进」补回工具描述。
-    if let Err(e) = crate::service::patch::todo_progress::apply(&app_handle) {
-        log::warn!("todo progress patch failed: {e}");
-    }
-    // 内置插件（dsh-tauri-*）只在壳的插件弹窗里可见：官方侧边栏 Plugins 页与插件市场
-    // 都按各自的硬编码内置/inbox 名单判断 bundle 归属，上游没有可配置开关，因此对这两个
-    // 前端做幂等补丁。最佳努力且幂等：锚点缺失（上游改写布局）时安全跳过。
-    if let Err(e) = crate::service::patch::plugin_visibility::apply(&app_handle) {
-        log::warn!("plugin visibility patch failed: {e}");
-    }
-    crate::service::patch::mcp_startup::apply(&app_handle)?;
-    mark_phase("core_patches", &mut phase_started);
-    // 预防性处理：pnpm 在无 TTY 环境（dsh-market 等子进程）下重装/更新插件时，
-    // 清理/重建 node_modules 会触发交互确认并因无 TTY 直接中止
-    // （ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY），表现为插件更新失败。
     // 启动时确保 profile 的 .npmrc 写入 confirmModulesPurge=false（幂等、保留
     // 已有配置）。最佳努力：失败只告警，不阻断启动。
     if let Err(e) = crate::service::plugin::ensure_profile_npmrc(&app_handle) {
         log::warn!("ensure profile .npmrc failed: {e}");
     }
+    // 弃用插件退役：清单 plugins.depercated 登记的插件若还在档案里，启动前移除。
+    // 它们与新核心不兼容，留着会被 loader 展开成启动白屏（Failed to load plugins），
+    // 而界面已不列这些 id，用户没有别的卸载入口。最佳努力：失败只告警，不阻断启动。
+    if let Err(e) = crate::service::plugin::retire_deprecated_plugins(&app_handle) {
+        log::warn!("retire deprecated plugins failed: {e}");
+    }
+    mark_phase("retire_deprecated_plugins", &mut phase_started);
     if let Err(e) = crate::service::plugin::ensure_internal_plugins(&app_handle).await {
         if crate::service::plugin::is_internal_plugin_startup_failure(&e) {
             log::error!("ensure internal plugins blocked startup: {e}");
@@ -797,38 +718,16 @@ pub async fn launch(app_handle: crate::AppHandle) -> Result<(), String> {
         return Err(e);
     }
     mark_phase("ensure_preset_plugins", &mut phase_started);
-    // 插件自愈（内置插件重装 / 预装插件完整性自检）可能刚把插件市场装进档案，而上一轮补丁
-    // 执行时它还不存在、已被安全跳过；自愈完成后按需重打一次（逐名字判定，已登记则跳过）。
-    if let Err(e) = crate::service::patch::plugin_visibility::apply(&app_handle) {
-        log::warn!("plugin visibility patch after plugin self-healing failed: {e}");
-    }
-    // 预打包核心运行时自愈：把 app 内置插件与 profile 插件入口链接进活动核心的
-    // node_modules（dsh 的 loader 以核心根为裸包解析根），并核验/修复 sharp/koffi
-    // 原生可选依赖。只作用于 CoreSource::App，本地核心由用户自行管理。dsh 在缺失
-    // 这些入口或原生依赖时无法启动，因此失败直接阻断本次 launch（前端展示可恢复
-    // 错误），而不是带着必然失败的核心继续 spawn。
     if let Err(e) = crate::service::core::prepare_active_runtime(&app_handle).await {
         log::error!("prepare active core runtime failed: {e}");
         return Err(e);
     }
     mark_phase("prepare_active_runtime", &mut phase_started);
-    // prepare 可能因核心原生模块的 ABI 与本地 node 不匹配而改用捆绑运行时
-    // （issue #441），此时必须重新解析：下面的 DSH_NODE 注入与 PATH 前置都以
-    // 这里的结果为准，否则子进程仍会用那个加载不了原生模块的本地 node。
-    let node_binary_path = config::get_node_binary_path(&app_handle);
-    if !node_binary_path.exists() {
-        log::error!("Node.js runtime resolved for launch is missing");
-        return Err(format!(
-            "NODE_NOT_FOUND: Node.js runtime is missing: {}",
-            node_binary_path.display()
-        ));
-    }
     let profile = crate::service::profile::active_profile(&app_handle);
     let plan = LaunchPlan {
         setting,
         profile_root: crate::service::profile::profile_dir_of(&app_handle, &profile),
         profile,
-        node: node_binary_path,
         dsh_binary: dsh_binary_path,
         core_dir: crate::service::core::active_core_dir(&app_handle),
         dsh_home,
@@ -840,6 +739,7 @@ pub async fn launch(app_handle: crate::AppHandle) -> Result<(), String> {
         resources: app_handle.path().resource_dir().ok(),
         git_dir: config::get_git_cmd_dir(&app_handle),
         user_pnpm: crate::service::cli::find_user_pnpm(&app_handle),
+        core_version: crate::service::core::active_version(&app_handle),
     };
     let notifications = Arc::new(OnceLock::new());
     let _ = notifications.set(app_handle);
@@ -873,7 +773,6 @@ pub(super) async fn launch_prepared(
     let LaunchPlan {
         setting,
         profile: active_profile,
-        node: node_binary_path,
         dsh_binary: dsh_binary_path,
         core_dir,
         profile_root,
@@ -886,13 +785,27 @@ pub(super) async fn launch_prepared(
         resources,
         git_dir,
         user_pnpm,
+        core_version,
     } = plan;
+    let native_bridge = if config::asar_ancestor(&dsh_binary_path).is_some() {
+        Some(crate::service::core::prepare_native_bridge(&bin_dir)?)
+    } else {
+        None
+    };
     let mut envs: HashMap<String, String> = HashMap::new();
     envs.insert(
         "DSH_HOME".to_string(),
         dsh_home.to_string_lossy().into_owned(),
     );
     envs.insert("DSH_TELEMETRY_DISABLED".to_string(), "1".to_string());
+    // 上游桌面组合读取 `DSH_CLIENT_VERSION` 作为产品埋点的 resource.service.version
+    // 与客户端版本元数据（Electron 壳在打包时注入）。Tauri 壳必须显式下发，否则
+    // `desktop-product-telemetry` 行会因缺少 serviceVersion 校验失败，依赖它的
+    // `product-analytics` 一直停在 pending。
+    envs.insert(
+        "DSH_CLIENT_VERSION".to_string(),
+        env!("CARGO_PKG_VERSION").to_string(),
+    );
     envs.insert("NO_COLOR".to_string(), "1".to_string());
     envs.insert("DSH_WEB_PORT".to_string(), setting.port.to_string());
     // 把服务实际使用的 node 路径显式交给子进程（pnpm/dsh shim 的 DSH_NODE
@@ -904,12 +817,33 @@ pub(super) async fn launch_prepared(
     // dunce::canonicalize 而不是 std::fs::canonicalize：后者在 Windows 上会
     // 返回 `\\?\` verbatim 前缀，cmd.exe 无法直接启动这种路径，导致 pnpm/dsh
     // shim 报 "The system cannot find the path specified."。
-    let node_abs =
-        dunce::canonicalize(&node_binary_path).unwrap_or_else(|_| node_binary_path.clone());
+    let node_abs = dunce::canonicalize(super::electron_executable(
+        notifications
+            .get()
+            .ok_or("APP_HANDLE_UNAVAILABLE: launch handle was not set")?,
+    )?)
+    .map_err(|error| format!("ELECTRON_EXECUTABLE_INVALID: {error}"))?;
     envs.insert(
         "DSH_NODE".to_string(),
         node_abs.to_string_lossy().into_owned(),
     );
+    // 把「随包 Electron 可执行文件」本身显式交给插件子进程。
+    //
+    // `DSH_NODE` 的语义是「用 Node 模式跑 dsh 内核的运行时」，它可以被用户自装的核心
+    // 换成别的 Node，并不承诺「这是一个可供插件复用的 GUI Electron」。插件若想复用
+    // 宿主 Electron 去拉一个透明置顶窗口（桌宠等），只能靠 `DSH_NODE` 反推，且必须自己
+    // 摘掉下面那个 `ELECTRON_RUN_AS_NODE=1`，既不可靠也容易踩坑。
+    //
+    // `DSH_ELECTRON_PATH` 专门表达这件事：值就是桌面端自己启动 GUI 的同一个二进制，
+    // 插件拉起窗口时直接用它、并自行移除 `ELECTRON_RUN_AS_NODE` 即可。与 `DSH_NODE`
+    // 同源（同一个 `electron_executable` 结果），不引入第二套路径解析。
+    envs.insert(
+        "DSH_ELECTRON_PATH".to_string(),
+        node_abs.to_string_lossy().into_owned(),
+    );
+    // 服务进程的可执行文件就是 Electron：不进 Node 模式会以 Chromium 启动，
+    // 派生 zygote/gpu/renderer 子进程而根本不执行 dsh（前端只看到端口没人监听）。
+    envs.insert("ELECTRON_RUN_AS_NODE".to_string(), "1".to_string());
 
     // 扩展 PATH，让 dsh 及其子进程能找到 node 与桌面端自动配置的 Git；Windows
     // 上再注入 Git Bash 的 bin 目录：persistent bash（--noprofile --norc）不执行
@@ -919,27 +853,27 @@ pub(super) async fn launch_prepared(
     // 前置应用自身的 shim 目录，使市场（dsh-market）及其子进程通过名字解析的
     // `pnpm`/`dsh` 都命中桌面端 shim，从而受桌面端 pnpm 选版策略管辖
     // （轻量缓解，issue #69 系列）。
-    if let Some(node_dir) = node_binary_path.parent() {
-        if let Some(existing_path) = std::env::var_os("PATH") {
-            let git_dirs = win_inspector::git_bash_bin_dirs();
-            // 只打印注入的前缀目录，完整 PATH 太长会刷屏
-            for dir in &git_dirs {
-                log::debug!("harness service PATH prepend: {}", dir.to_string_lossy());
-            }
-            let mut paths = vec![bin_dir.clone()];
-            paths.push(node_dir.to_path_buf());
-            if let Some(git_dir) = git_dir {
-                log::debug!(
-                    "harness service Git PATH prepend: {}",
-                    git_dir.to_string_lossy()
-                );
-                paths.push(git_dir);
-            }
-            paths.extend(git_dirs);
-            paths.extend(std::env::split_paths(&existing_path));
-            if let Ok(new_path) = std::env::join_paths(paths) {
-                envs.insert("PATH".to_string(), new_path.to_string_lossy().into_owned());
-            }
+    if let Some(node_dir) = node_abs.parent()
+        && let Some(existing_path) = std::env::var_os("PATH")
+    {
+        let git_dirs = win_inspector::git_bash_bin_dirs();
+        // 只打印注入的前缀目录，完整 PATH 太长会刷屏
+        for dir in &git_dirs {
+            log::debug!("harness service PATH prepend: {}", dir.to_string_lossy());
+        }
+        let mut paths = vec![bin_dir.clone()];
+        paths.push(node_dir.to_path_buf());
+        if let Some(git_dir) = git_dir {
+            log::debug!(
+                "harness service Git PATH prepend: {}",
+                git_dir.to_string_lossy()
+            );
+            paths.push(git_dir);
+        }
+        paths.extend(git_dirs);
+        paths.extend(std::env::split_paths(&existing_path));
+        if let Ok(new_path) = std::env::join_paths(paths) {
+            envs.insert("PATH".to_string(), new_path.to_string_lossy().into_owned());
         }
     }
 
@@ -963,7 +897,7 @@ pub(super) async fn launch_prepared(
         &pnpm_root,
         &pnpm_binary,
         user_pnpm.as_deref(),
-        &node_binary_path,
+        &node_abs,
         &bin_dir,
     )
     .await
@@ -986,11 +920,15 @@ pub(super) async fn launch_prepared(
     // 最佳努力：空值返回空 map，不覆盖用户已有的同名环境变量。
     envs.extend(config::proxy::proxy_child_env(&setting.proxy_url));
 
-    envs.insert("DSH_TAURI_EMBEDDED".to_string(), "1".to_string());
+    envs.insert("DSH_TAURI_EMBEDDED".to_string(), "0".to_string());
+    envs.insert("DSH_TAURI_DESKTOP".to_string(), "1".to_string());
+    if let Some(version) = core_version.as_deref() {
+        envs.insert("DSH_TAURI_CORE_VERSION".to_string(), version.to_string());
+    }
 
     // issue #1064：AppImage 的旧库不能泄漏给 Harness 启动的宿主目录选择器。
     #[cfg(target_os = "linux")]
-    let library_path = harness_library_path(
+    let library_path = crate::utils::child_library_path(
         std::env::var_os("APPDIR").as_deref(),
         std::env::var_os("LD_LIBRARY_PATH").as_deref(),
     );
@@ -1032,17 +970,16 @@ pub(super) async fn launch_prepared(
     // 完全无视）。既然这次要显式下发用户设置，就把继承来的堆 flag 从子进程环境里
     // 摘掉——只删堆相关项，`--require` 等其余选项原样保留；否则「已设置 16384」
     // 仍可能是一句谎话。
-    if super::heap::heap_option_arg(heap_mb).is_some() {
-        if let Ok(node_options) = std::env::var("NODE_OPTIONS") {
-            if super::heap::node_options_has_heap_flags(&node_options) {
-                let stripped = super::heap::node_options_without_heap_flags(&node_options);
-                log::info!(
-                    "Dropped inherited heap flags from NODE_OPTIONS for the Harness process (kept={:?})",
-                    stripped
-                );
-                envs.insert("NODE_OPTIONS".to_string(), stripped.unwrap_or_default());
-            }
-        }
+    if super::heap::heap_option_arg(heap_mb).is_some()
+        && let Ok(node_options) = std::env::var("NODE_OPTIONS")
+        && super::heap::node_options_has_heap_flags(&node_options)
+    {
+        let stripped = super::heap::node_options_without_heap_flags(&node_options);
+        log::info!(
+            "Dropped inherited heap flags from NODE_OPTIONS for the Harness process (kept={:?})",
+            stripped
+        );
+        envs.insert("NODE_OPTIONS".to_string(), stripped.unwrap_or_default());
     }
     // 提示里说的上限必须与进程真正拿到的上限一致，否则用户会看到「已设置 8192
     // 还提示 8192」这种自相矛盾的诊断（详见 heap.rs 的优先级说明）。
@@ -1092,7 +1029,6 @@ pub(super) async fn launch_prepared(
     }
     let port = setting.port;
     mark_phase("pre_spawn_setup", &mut phase_started);
-    super::startup::note_spawn();
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
         .name("harness-startup".into())
@@ -1125,7 +1061,7 @@ pub(super) async fn launch_prepared(
                     &mut started,
                     guards,
                     |report_path| {
-                        let args = build_harness_args(
+                        let mut args = build_harness_args(
                             &dsh_binary_path,
                             &active_profile,
                             hmr_patch.as_deref(),
@@ -1133,12 +1069,21 @@ pub(super) async fn launch_prepared(
                             heap_mb,
                             report_path,
                         );
+                        if let Some(bridge) = &native_bridge {
+                            args.splice(
+                                0..0,
+                                [
+                                    OsString::from("--require"),
+                                    bridge.as_os_str().to_os_string(),
+                                ],
+                            );
+                        }
                         #[cfg(windows)]
                         {
                             use std::os::windows::io::{FromRawHandle, OwnedHandle};
                             let spawned = if let Some(job) = job.as_deref() {
                                 super::win_spawn::spawn_with_hidden_console_in_job(
-                                    &node_binary_path,
+                                    &node_abs,
                                     &args,
                                     Some(&core_dir),
                                     &envs,
@@ -1146,7 +1091,7 @@ pub(super) async fn launch_prepared(
                                 )
                             } else {
                                 super::win_spawn::spawn_with_hidden_console_owned(
-                                    &node_binary_path,
+                                    &node_abs,
                                     &args,
                                     Some(&core_dir),
                                     &envs,
@@ -1169,7 +1114,7 @@ pub(super) async fn launch_prepared(
                         #[cfg(unix)]
                         {
                             use std::os::unix::process::CommandExt;
-                            let mut command = Command::new(&node_binary_path);
+                            let mut command = Command::new(&node_abs);
                             command
                                 .args(args)
                                 .envs(&envs)
@@ -1198,6 +1143,7 @@ pub(super) async fn launch_prepared(
                     |pid| {
                         let _ = fs::write(&pid_path, format!("{pid}\n{port}\n"));
                     },
+                    wait_harness,
                 );
                 if let Err(error) = result {
                     log::error!("Harness startup supervisor failed: {error}");
@@ -1218,118 +1164,6 @@ pub(super) async fn launch_prepared(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(target_os = "linux")]
-    mod appimage_library_path {
-        use super::*;
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::{OsStrExt, OsStringExt};
-
-        #[test]
-        fn removes_only_appimage_library_directories() {
-            assert_eq!(
-                harness_library_path(
-                    Some(OsStr::new("/tmp/.mount_DSH")),
-                    Some(OsStr::new("/opt/custom/lib:/tmp/.mount_DSH/usr/lib:/tmp/.mount_DSH:/tmp/.mount_DSH-other/lib:")),
-                ),
-                Some(OsString::from("/opt/custom/lib:/tmp/.mount_DSH-other/lib:")),
-            );
-        }
-
-        #[test]
-        fn filters_semicolon_and_mixed_library_path_separators() {
-            for path in [
-                "/opt/custom/lib;/tmp/.mount_DSH/usr/lib",
-                "/tmp/.mount_DSH/usr/lib;/opt/custom/lib",
-                "/tmp/.mount_DSH/usr/lib:/opt/custom/lib;/tmp/.mount_DSH/usr/lib64",
-            ] {
-                assert_eq!(
-                    harness_library_path(
-                        Some(OsStr::new("/tmp/.mount_DSH")),
-                        Some(OsStr::new(path))
-                    ),
-                    Some(OsString::from("/opt/custom/lib")),
-                    "{path}",
-                );
-            }
-        }
-
-        #[test]
-        fn retains_empty_components_and_loader_tokens() {
-            assert_eq!(
-                harness_library_path(
-                    Some(OsStr::new("/tmp/.mount_DSH")),
-                    Some(OsStr::new(";/tmp/.mount_DSH/usr/lib;;$ORIGIN/$LIB:;")),
-                ),
-                Some(OsString::from("::$ORIGIN/$LIB::")),
-            );
-        }
-
-        #[test]
-        fn filters_non_utf8_appimage_paths_without_removing_siblings() {
-            assert_eq!(
-                harness_library_path(
-                    Some(OsStr::from_bytes(b"/tmp/.mount_\xff")),
-                    Some(OsStr::from_bytes(
-                        b"/tmp/.mount_\xff/usr/lib;/opt/\xfe/lib:/tmp/.mount_\xff-other/lib"
-                    )),
-                ),
-                Some(OsString::from_vec(
-                    b"/opt/\xfe/lib:/tmp/.mount_\xff-other/lib".to_vec()
-                )),
-            );
-        }
-
-        #[test]
-        fn preserves_library_path_without_an_appimage_directory() {
-            let path = Some(OsStr::new("/opt/custom/lib"));
-            assert_eq!(
-                harness_library_path(None, path),
-                Some(OsString::from("/opt/custom/lib"))
-            );
-            assert_eq!(
-                harness_library_path(Some(OsStr::new("")), path),
-                Some(OsString::from("/opt/custom/lib"))
-            );
-        }
-
-        #[test]
-        fn preserves_an_unset_library_path() {
-            assert_eq!(
-                harness_library_path(Some(OsStr::new("/tmp/.mount_DSH")), None),
-                None
-            );
-        }
-
-        #[test]
-        fn clears_a_library_path_containing_only_appimage_directories() {
-            for path in [
-                "/tmp/.mount_DSH/usr/lib",
-                "/tmp/.mount_DSH/usr/lib;/tmp/.mount_DSH/usr/lib64",
-                "",
-            ] {
-                assert_eq!(
-                    harness_library_path(
-                        Some(OsStr::new("/tmp/.mount_DSH")),
-                        Some(OsStr::new(path))
-                    ),
-                    Some(OsString::new()),
-                    "{path}",
-                );
-            }
-        }
-
-        #[test]
-        fn preserves_non_utf8_user_library_paths() {
-            assert_eq!(
-                harness_library_path(
-                    Some(OsStr::new("/tmp/.mount_DSH")),
-                    Some(OsStr::from_bytes(b"/opt/\xff/lib:/tmp/.mount_DSH/usr/lib"))
-                ),
-                Some(OsString::from_vec(b"/opt/\xff/lib".to_vec())),
-            );
-        }
-    }
 
     #[test]
     fn occupied_port_advances_to_a_free_port() {
@@ -1511,18 +1345,20 @@ mod tests {
         spawned: std::sync::Arc<std::sync::Mutex<Option<OwnedProcess>>>,
         resets: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         transition: std::sync::Arc<tokio::sync::Mutex<()>>,
+        probe_entered: std::sync::mpsc::Receiver<()>,
+        probe_release: Option<std::sync::mpsc::Sender<()>>,
     }
 
     impl SupervisedNode {
         fn new(script: &str) -> Self {
-            Self::with_reader_failure(script, 0)
+            Self::with_probe(script, 0, false)
         }
 
-        fn with_reader_failure(script: &str, reader: usize) -> Self {
-            use std::sync::{atomic::AtomicUsize, Arc, Mutex};
+        fn with_probe(script: &str, reader: usize, early_exit: bool) -> Self {
+            use std::sync::{Arc, Mutex, atomic::AtomicUsize};
 
-            let node = config::get_local_node_path()
-                .expect("supported Node.js required for supervisor tests");
+            let node = crate::service::workflow::test_runtime_executable()
+                .expect("bundled Electron runtime required for supervisor tests");
             let root = tempfile::tempdir().unwrap();
             let path = root.path().to_path_buf();
             let script_path = path.join("fixture.cjs");
@@ -1541,6 +1377,7 @@ mod tests {
                     path.join("AppData/Local").to_string_lossy().into_owned(),
                 ),
                 ("DSH_E2E_HOME".into(), path.to_string_lossy().into_owned()),
+                ("ELECTRON_RUN_AS_NODE".into(), "1".into()),
                 ("NODE_OPTIONS".into(), String::new()),
                 ("NODE_PATH".into(), String::new()),
             ]);
@@ -1557,6 +1394,8 @@ mod tests {
             );
             let (started_tx, started_rx) = tokio::sync::oneshot::channel();
             let (finished_tx, finished) = std::sync::mpsc::channel();
+            let (probe_entered_tx, probe_entered) = std::sync::mpsc::channel();
+            let (probe_release, probe_release_rx) = std::sync::mpsc::channel();
             let spawned = Arc::new(Mutex::new(None));
             let spawned_process = spawned.clone();
             let spawn_count = attempts.clone();
@@ -1564,6 +1403,7 @@ mod tests {
             let worker = std::thread::spawn(move || {
                 let log = path.join("dsh-web.log");
                 let mut started = Some(started_tx);
+                let mut probe_entered_tx = Some(probe_entered_tx);
                 let result = super::super::utils::with_output_reader_failure(reader, || {
                     super::super::instances::scope_sync(profile, || {
                         supervise_harness(
@@ -1654,6 +1494,24 @@ mod tests {
                                 reset_active_profile_root(&path);
                             },
                             |pid| fs::write(path.join("harness.pid"), pid.to_string()).unwrap(),
+                            |child, timeout| {
+                                if let Some(entered) = probe_entered_tx.take() {
+                                    entered.send(()).unwrap();
+                                    probe_release_rx.recv().map_err(|error| {
+                                        format!("FIXTURE_PROBE_RELEASE_FAILED: {error}")
+                                    })?;
+                                }
+                                if early_exit {
+                                    let exited = wait_harness(
+                                        child,
+                                        Some(std::time::Duration::from_secs(20)),
+                                    )?;
+                                    assert!(exited.is_some(), "fixture must exit before probe returns");
+                                    Ok(exited)
+                                } else {
+                                    wait_harness(child, timeout)
+                                }
+                            },
                         )
                     })
                 });
@@ -1672,35 +1530,72 @@ mod tests {
                 spawned,
                 resets,
                 transition,
+                probe_entered,
+                probe_release: Some(probe_release),
             }
         }
 
         fn acknowledge(&mut self) {
-            tokio::runtime::Builder::new_current_thread()
+            self.probe_entered
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .expect("fixture must spawn, register, and enter the startup probe");
+            self.started
+                .take()
+                .unwrap()
+                .try_recv()
+                .expect("spawn acknowledgement must precede the blocked startup probe")
+                .expect("fixture must spawn and register");
+        }
+
+        fn release_probe(&mut self) {
+            if let Some(release) = self.probe_release.take() {
+                let _ = release.send(());
+            }
+        }
+
+        /// 等待日志里出现全部片段：deadline 是「多久没有新进展」，不是绝对上限。
+        ///
+        /// fixture 一口气写满两根管道（约 1 MiB），CI 上读端调度快慢能差一个数量级；
+        /// 固定 6 秒绝对等待会把「慢」判成「挂」（issue #1384）。这里每看到日志增长就
+        /// 重新计时，真卡死（不再增长）才失败，并把已读字节数带进失败信息。
+        fn wait_for_log(&self, needles: &[&str]) {
+            const IDLE_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+            let log = self.root.path().join("dsh-web.log");
+            let mut seen = 0usize;
+            let mut deadline = std::time::Instant::now() + IDLE_LIMIT;
+            loop {
+                let text = fs::read_to_string(&log).unwrap_or_default();
+                if needles.iter().all(|needle| text.contains(needle)) {
+                    return;
+                }
+                if text.len() > seen {
+                    seen = text.len();
+                    deadline = std::time::Instant::now() + IDLE_LIMIT;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "supervisor fixture log stalled at {seen} bytes without {:?}",
+                    needles
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        /// 等待 supervisor 释放核心转换锁：直接等这把锁（带上界），不再轮询布尔状态。
+        ///
+        /// 守卫的释放顺序是「启动守卫 → 转换锁」，因此拿到锁即等于 `launching` 已复位，
+        /// 既是有明确上界的事件等待，也不再依赖轮询间隔的运气。
+        fn wait_transition_released(&self) {
+            let guard = tokio::runtime::Builder::new_current_thread()
                 .enable_time()
                 .build()
                 .unwrap()
                 .block_on(async {
-                    tokio::time::timeout(
-                        std::time::Duration::from_secs(2),
-                        self.started.take().unwrap(),
-                    )
-                    .await
+                    tokio::time::timeout(std::time::Duration::from_secs(20), self.transition.lock())
+                        .await
                 })
-                .expect("spawn acknowledgement must not wait for the startup probe")
-                .expect("supervisor must send acknowledgement")
-                .expect("fixture must spawn and register");
-        }
-
-        fn wait_until(&self, check: impl Fn() -> bool) {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
-            while !check() {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "supervisor fixture condition timed out"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
+                .expect("supervisor must release the core transition");
+            drop(guard);
         }
 
         fn cancel(&self) -> Result<(), String> {
@@ -1730,6 +1625,7 @@ mod tests {
         }
 
         fn finish(&mut self) -> Result<(), String> {
+            self.release_probe();
             let result = self
                 .finished
                 .recv_timeout(std::time::Duration::from_secs(10))
@@ -1741,6 +1637,7 @@ mod tests {
 
     impl Drop for SupervisedNode {
         fn drop(&mut self) {
+            self.release_probe();
             let _ = self.cancel();
             if let Some(worker) = self.worker.take().filter(|worker| worker.is_finished()) {
                 let _ = worker.join();
@@ -1749,7 +1646,7 @@ mod tests {
     }
 
     fn assert_reader_failure_is_reaped(reader: usize) {
-        let mut fixture = SupervisedNode::with_reader_failure("setTimeout(()=>{},60000)", reader);
+        let mut fixture = SupervisedNode::with_probe("setTimeout(()=>{},60000)", reader, false);
         let error = fixture.finish().unwrap_err();
         assert_eq!(
             error,
@@ -1810,6 +1707,19 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_acknowledges_while_startup_probe_is_blocked() {
+        let mut fixture = SupervisedNode::new("process.exit(0)");
+        fixture.acknowledge();
+        assert_eq!(
+            fixture.finished.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+        fixture.release_probe();
+        fixture.finish().unwrap();
+        assert!(fixture.instance.process.lock().unwrap().is_none());
+    }
+
+    #[test]
     fn supervisor_acknowledges_before_probe_and_drains_both_full_pipes() {
         let mut fixture = SupervisedNode::new(
             "const fs=require('fs'); const chunk='x'.repeat(1024)+'\\n'; for(let i=0;i<512;i++){fs.writeSync(1,'OUT:'+chunk);fs.writeSync(2,'ERR:'+chunk)} fs.writeSync(1,'STDOUT_DONE\\n');fs.writeSync(2,'STDERR_DONE\\n');setTimeout(()=>{},10000)",
@@ -1829,18 +1739,13 @@ mod tests {
         );
         assert!(fixture.instance.launching.load(Ordering::SeqCst));
         assert!(fixture.transition.try_lock().is_err());
-        let log = fixture.root.path().join("dsh-web.log");
-        fixture.wait_until(|| {
-            fs::read_to_string(&log)
-                .is_ok_and(|text| text.contains("STDOUT_DONE") && text.contains("STDERR_DONE"))
-        });
-        let output = fs::read_to_string(log).unwrap();
+        fixture.wait_for_log(&["STDOUT_DONE", "STDERR_DONE"]);
+        let output = fs::read_to_string(fixture.root.path().join("dsh-web.log")).unwrap();
         assert_eq!(output.matches("OUT:").count(), 512);
         assert_eq!(output.matches("ERR:").count(), 512);
-        fixture.wait_until(|| {
-            !fixture.instance.launching.load(Ordering::SeqCst)
-                && fixture.transition.try_lock().is_ok()
-        });
+        fixture.release_probe();
+        fixture.wait_transition_released();
+        assert!(!fixture.instance.launching.load(Ordering::SeqCst));
         assert!(fixture.instance.process.lock().unwrap().is_some());
         fixture.cancel().unwrap();
         fixture.finish().unwrap();
@@ -1850,26 +1755,47 @@ mod tests {
     #[test]
     fn supervisor_retries_only_duplicate_code_one_at_most_twice() {
         for (script, attempts, resets) in [
-            ("require('fs').writeSync(2,'duplicate loader entry id: fixture\\n');process.exit(1)", 3, 2),
-            ("require('fs').writeSync(2,'Error: EADDRINUSE\\n');process.exit(1)", 1, 0),
-            ("require('fs').writeSync(2,'duplicate loader entry id: fixture\\n');process.exit(0)", 1, 0),
+            (
+                "require('fs').writeSync(2,'duplicate loader entry id: fixture\\n');process.exit(1)",
+                3,
+                2,
+            ),
+            (
+                "require('fs').writeSync(2,'Error: EADDRINUSE\\n');process.exit(1)",
+                1,
+                0,
+            ),
+            (
+                "require('fs').writeSync(2,'duplicate loader entry id: fixture\\n');process.exit(0)",
+                1,
+                0,
+            ),
         ] {
-            let mut fixture = SupervisedNode::new(script);
+            let mut fixture = SupervisedNode::with_probe(script, 0, true);
             fixture.acknowledge();
             fixture.finish().unwrap();
-            assert_eq!(fixture.attempts.load(Ordering::SeqCst), attempts, "{script}");
+            assert_eq!(
+                fixture.attempts.load(Ordering::SeqCst),
+                attempts,
+                "{script}"
+            );
             assert_eq!(fixture.resets.load(Ordering::SeqCst), resets, "{script}");
             assert!(fixture.instance.process.lock().unwrap().is_none());
             assert!(!fixture.instance.launching.load(Ordering::SeqCst));
-            assert_eq!(*fixture.instance.status.lock().unwrap(), status::Status::Stopped);
+            assert_eq!(
+                *fixture.instance.status.lock().unwrap(),
+                status::Status::Stopped
+            );
             assert!(fixture.transition.try_lock().is_ok());
         }
     }
 
     #[test]
     fn supervisor_releases_ownership_and_guards_when_retry_spawn_fails() {
-        let mut fixture = SupervisedNode::new(
+        let mut fixture = SupervisedNode::with_probe(
             "const fs=require('fs');fs.writeFileSync('fail-next-spawn','1');fs.writeSync(2,'duplicate loader entry id: fixture\\n');process.exit(1)",
+            0,
+            true,
         );
         fixture.acknowledge();
         assert_eq!(
@@ -1883,10 +1809,8 @@ mod tests {
             *fixture.instance.status.lock().unwrap(),
             status::Status::Stopped
         );
-        fixture.wait_until(|| {
-            !fixture.instance.launching.load(Ordering::SeqCst)
-                && fixture.transition.try_lock().is_ok()
-        });
+        fixture.wait_transition_released();
+        assert!(!fixture.instance.launching.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -1895,10 +1819,7 @@ mod tests {
             "require('fs').writeSync(2,'duplicate loader entry id: fixture\\n');setTimeout(()=>{},10000)",
         );
         fixture.acknowledge();
-        let log = fixture.root.path().join("dsh-web.log");
-        fixture.wait_until(|| {
-            fs::read_to_string(&log).is_ok_and(|text| text.contains("duplicate loader entry"))
-        });
+        fixture.wait_for_log(&["duplicate loader entry"]);
         assert!(fixture.instance.launching.load(Ordering::SeqCst));
         fixture.cancel().unwrap();
         if let Err(error) = fixture.finish() {

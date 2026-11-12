@@ -32,8 +32,15 @@
     },
     "linux": {
       "deb": {
+        "depends": [
+          "zenity",
+          "libudev1"
+        ],
         "conflicts": [],
-        "replaces": []
+        "replaces": [],
+        "postInstallScript": "templates/linux/postinst.sh",
+        "postRemoveScript": "templates/linux/postrm.sh",
+        "desktopTemplate": "templates/linux/main.desktop"
       }
     },
     "windows": {

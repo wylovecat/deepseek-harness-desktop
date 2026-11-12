@@ -1,15 +1,13 @@
-use crate::{AppHandle};
+use crate::AppHandle;
 use serde::Serialize;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use tauri::{ Manager, Runtime};
+use tauri::{Manager, Runtime};
 
 use super::constants::*;
 use super::dependencies;
-use super::utils::search_node_binary;
-use super::{detect_region, Region};
+use super::{Region, detect_region};
 
 /// 获取当前构建专用的 AppData 基础目录。
 ///
@@ -40,59 +38,78 @@ pub(crate) fn base_dir_from(app_data: impl FnOnce() -> PathBuf) -> PathBuf {
     }
 }
 
-/// Node.js 官方/镜像下载前缀：国内走 npmmirror，其他直连 nodejs.org
-fn node_base_url(region: Region) -> &'static str {
-    match region {
-        Region::Domestic => NODE_MIRROR_BASE_URL,
-        Region::Overseas => NODE_BASE_URL,
-    }
+/// 旧版独立 Node 运行时的托管根（`$AppData/runtime`）。
+///
+/// 仅用于启动时清理：dsh 与 pnpm 已改为以随包 Electron 的 Node 模式运行，这个
+/// 目录只可能是历史安装留下的残留。
+pub fn legacy_node_root<R: Runtime>(app_handle: &AppHandle<R>) -> PathBuf {
+    get_base_dir(app_handle).join(LEGACY_NODE_ROOT_DIR)
 }
 
-/// Node.js 官方发行包文件名（按平台与架构）
-///
-/// 抽成纯函数以便单元测试覆盖所有平台（与宿主操作系统无关），
-/// 生产代码用 `env::consts::OS` / `env::consts::ARCH` 调用。
-fn node_pkg_filename(os: &str, arch: &str) -> Result<String, String> {
+fn dsh_pkg_asset_stem(os: &str, arch: &str) -> Result<String, String> {
     match (os, arch) {
-        ("macos", "aarch64") => Ok(format!("node-{}-darwin-arm64.tar.gz", NODE_VERSION)),
-        ("macos", "x86_64") => Ok(format!("node-{}-darwin-x64.tar.gz", NODE_VERSION)),
-        ("windows", _) => Ok(format!("node-{}-win-x64.zip", NODE_VERSION)),
-        ("linux", "x86_64") => Ok(format!("node-{}-linux-x64.tar.gz", NODE_VERSION)),
-        ("linux", "aarch64") => Ok(format!("node-{}-linux-arm64.tar.gz", NODE_VERSION)),
+        ("windows", "x86_64") => Ok("deepseek-harness-pkg-windows".to_string()),
+        ("windows", "aarch64") => Ok("deepseek-harness-pkg-windows-arm64".to_string()),
+        ("macos", "aarch64") => Ok("deepseek-harness-pkg-macos-arm64".to_string()),
+        ("macos", "x86_64") => Ok("deepseek-harness-pkg-macos-x64".to_string()),
+        ("linux", "x86_64") => Ok("deepseek-harness-pkg-linux".to_string()),
+        ("linux", "aarch64") => Ok("deepseek-harness-pkg-linux-arm64".to_string()),
         _ => Err(format!("Unsupported platform: {} {}", os, arch)),
     }
 }
 
-/// Node.js 运行时下载地址
-pub fn get_node_download_url() -> Result<String, String> {
-    let filename = node_pkg_filename(env::consts::OS, env::consts::ARCH)?;
+/// Harness 发行版下载资产文件名：asar 核心是 `<平台>.asar.zip`（归档外层再套一层 zip），
+/// 目录核心是 `<平台>.zip`（解压后直接就是核心目录树）。
+fn dsh_pkg_asset_filename(os: &str, arch: &str, core_asar: bool) -> Result<String, String> {
+    let stem = dsh_pkg_asset_stem(os, arch)?;
+    Ok(if core_asar {
+        format!("{stem}.asar.zip")
+    } else {
+        format!("{stem}.zip")
+    })
+}
+
+/// 当前平台的核心发行版资产名：下载地址与 release 资产匹配共用这一处命名。
+pub fn dsh_pkg_asset_name(core_asar: bool) -> Result<String, String> {
+    dsh_pkg_asset_filename(env::consts::OS, env::consts::ARCH, core_asar)
+}
+
+/// 解压后落在托管根里的核心归档文件名（`deepseek-harness-pkg-<平台>.asar`）。
+pub fn dsh_core_asar_filename() -> Result<String, String> {
     Ok(format!(
-        "{}/{}/{}",
-        node_base_url(detect_region()),
-        NODE_VERSION,
-        filename
+        "{}.asar",
+        dsh_pkg_asset_stem(env::consts::OS, env::consts::ARCH)?
     ))
 }
 
-/// Harness 发行版资产文件名（按平台与架构）
-fn dsh_pkg_asset_filename(os: &str, arch: &str) -> Result<String, String> {
-    match (os, arch) {
-        ("windows", _) => Ok("deepseek-harness-pkg-windows.zip".to_string()),
-        ("macos", "aarch64") => Ok("deepseek-harness-pkg-macos-arm64.zip".to_string()),
-        ("macos", "x86_64") => Ok("deepseek-harness-pkg-macos-x64.zip".to_string()),
-        ("linux", "x86_64") => Ok("deepseek-harness-pkg-linux.zip".to_string()),
-        ("linux", "aarch64") => Ok("deepseek-harness-pkg-linux-arm64.zip".to_string()),
-        _ => Err(format!("Unsupported platform: {} {}", os, arch)),
+pub fn core_archive_in(core_root: &Path) -> Option<PathBuf> {
+    let name = dsh_core_asar_filename().ok()?;
+    let archive = core_root.join(name);
+    archive.is_file().then_some(archive)
+}
+
+/// 路径上的第一个 asar 归档祖先（普通磁盘路径返回 `None`）。
+///
+/// asar 只读、只有 Electron 的 `fs` 能穿越，`std::fs` 对归档内部一律 ENOENT。
+pub fn asar_ancestor(path: &Path) -> Option<&Path> {
+    path.ancestors().find(|candidate| {
+        candidate
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("asar"))
+    })
+}
+
+// issue #1377：std::fs 无法穿越 asar，按归档索引检查入口。
+pub fn core_entry_exists(path: &Path) -> bool {
+    match asar_ancestor(path) {
+        Some(_) => super::asar::contains(path),
+        None => path.exists(),
     }
 }
 
 /// 打包的 DeepSeek Harness 发行版下载地址（GitHub 官方直连，首选源）
-pub fn get_dsh_download_url() -> Result<String, String> {
-    Ok(format!(
-        "{}{}",
-        DSH_CORE_URL,
-        dsh_pkg_asset_filename(env::consts::OS, env::consts::ARCH)?
-    ))
+pub fn get_dsh_download_url(core_asar: bool) -> Result<String, String> {
+    Ok(format!("{DSH_CORE_URL}{}", dsh_pkg_asset_name(core_asar)?))
 }
 
 /// 为任意 GitHub Release 资产 URL 生成全部镜像兜底地址
@@ -109,71 +126,21 @@ pub fn mirror_download_urls(asset_url: &str) -> Vec<String> {
 /// 把 latest 下载地址中的 `releases/latest/download/` 替换为
 /// `releases/download/<tag>/`，镜像/直连与平台文件名逻辑与最新版完全一致
 /// （GitHub 的 tag 下载路径是固定的 release 资产地址，可被确定性推导）。
-pub fn get_dsh_download_url_for_tag(tag: &str) -> Result<String, String> {
+pub fn get_dsh_download_url_for_tag(tag: &str, core_asar: bool) -> Result<String, String> {
     let base = DSH_CORE_URL.replace(
         "releases/latest/download/",
         &format!("releases/download/{tag}/"),
     );
-    Ok(format!(
-        "{}{}",
-        base,
-        dsh_pkg_asset_filename(env::consts::OS, env::consts::ARCH)?
-    ))
-}
-
-/// 在 PATH 及常见安装目录中查找 node 可执行文件（不校验版本）
-fn find_local_node_binary() -> Option<PathBuf> {
-    let bin_name = if cfg!(windows) { "node.exe" } else { "node" };
-
-    let path_dirs: Vec<PathBuf> =
-        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .filter(|dir| !dir.as_os_str().is_empty())
-            .collect();
-
-    // macOS 上从 Finder/launchd 启动时 PATH 可能不完整，补充常见安装目录
-    #[cfg(target_os = "macos")]
-    let dirs: Vec<PathBuf> = {
-        let mut dirs = path_dirs;
-        dirs.extend([
-            PathBuf::from("/opt/homebrew/bin"),
-            PathBuf::from("/usr/local/bin"),
-        ]);
-        dirs
-    };
-
-    #[cfg(not(target_os = "macos"))]
-    let dirs = path_dirs;
-
-    for dir in dirs {
-        let candidate = dir.join(bin_name);
-        if candidate.is_file() && is_executable(&candidate) {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-#[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    path.metadata()
-        .map(|meta| meta.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn is_executable(_path: &Path) -> bool {
-    true
+    Ok(format!("{base}{}", dsh_pkg_asset_name(core_asar)?))
 }
 
 fn node_version_output(node: &Path, args: &[&str]) -> Option<std::process::Output> {
-    #[cfg(windows)]
-    if let Some(output) = crate::service::workflow::early::probe_output(node, args, true) {
-        return output.ok();
-    }
     let mut command = std::process::Command::new(node);
     // 版本查询不应执行用户的 preload；真实服务仍沿用其 NODE_OPTIONS。
-    command.args(args).env_remove("NODE_OPTIONS");
+    command
+        .args(args)
+        .env("ELECTRON_RUN_AS_NODE", "1")
+        .env_remove("NODE_OPTIONS");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -189,16 +156,12 @@ fn probe_node_version(node: &Path) -> Option<(String, Option<PathBuf>)> {
             "-p",
             "JSON.stringify([process.versions.node,process.execPath])",
         ],
-    ) {
-        if output.status.success() {
-            if let Ok((version, actual)) =
-                serde_json::from_slice::<(String, PathBuf)>(&output.stdout)
-            {
-                if semver::Version::parse(&version).is_ok() && actual.is_absolute() {
-                    return Some((version, Some(actual)));
-                }
-            }
-        }
+    ) && output.status.success()
+        && let Ok((version, actual)) = serde_json::from_slice::<(String, PathBuf)>(&output.stdout)
+        && semver::Version::parse(&version).is_ok()
+        && actual.is_absolute()
+    {
+        return Some((version, Some(actual)));
     }
     let output = node_version_output(node, &["--version"])?;
     if !output.status.success() {
@@ -231,10 +194,10 @@ fn cached_node_version(
         drop(guard);
         return probe().map(|(version, _)| version);
     };
-    if let Some((cached_key, version)) = guard.as_ref() {
-        if cached_key == &key {
-            return Some(version.clone());
-        }
+    if let Some((cached_key, version)) = guard.as_ref()
+        && cached_key == &key
+    {
+        return Some(version.clone());
     }
     let (version, actual) = probe()?;
     // 静态转发器可不改自身文件就切换 Node，只有实际执行文件一致才可复用版本。
@@ -249,108 +212,20 @@ fn cached_node_version(
     Some(version)
 }
 
-/// 获取指定 Node.js 二进制的版本号（例如 "22.22.0"）
+/// 获取指定可执行文件的 Node 版本号（例如 "24.21.0"）
+///
+/// Electron 在 Node 模式下报告的是它内置的 Node 版本，探测方式与独立 node 相同。
 pub fn get_node_version_of_path(node: &Path) -> Option<String> {
     cached_node_version(node, &NODE_VERSION_CACHE, || probe_node_version(node))
 }
 
-/// 检测本地是否存在版本兼容的 Node.js 环境，返回其二进制路径
-pub fn get_local_node_path() -> Option<PathBuf> {
-    let node = find_local_node_binary()?;
-    let version = get_node_version_of_path(&node)?;
-    is_supported_node_version(&version).then_some(node)
-}
-
-/// 原生模块 ABI 探测结论：本地 Node 无法加载活动核心的原生模块时，本进程内
-/// 强制改用捆绑运行时。
+/// 运行 dsh/pnpm 的唯一运行时：随包分发的 Electron（`ELECTRON_RUN_AS_NODE=1`）。
 ///
-/// 由 `service::core::runtime::prepare_active_runtime` 在拉起 dsh 之前探测并设置：
-/// 原生模块的 ABI 在构建期确定（预打包核心由 pkg 构建期的 Node 决定），而本地 Node
-/// 只按 semver 挑选，可能与其不匹配（issue #441：Node 25 的 ABI 141 加载 ABI 137 的
-/// `fs_ext.node`）。置位后所有 node 解析（服务进程、`DSH_NODE` 注入、运行环境展示）
-/// 统一走捆绑运行时，避免各处各选一个运行时。
-static PREFER_BUNDLED_NODE_RUNTIME: AtomicBool = AtomicBool::new(false);
-
-/// 是否因原生模块 ABI 不匹配而强制使用捆绑运行时
-pub fn prefer_bundled_node_runtime() -> bool {
-    PREFER_BUNDLED_NODE_RUNTIME.load(Ordering::Relaxed)
-}
-
-/// 设置捆绑运行时偏好（仅由启动前的原生模块探测调用）
-pub fn set_prefer_bundled_node_runtime(prefer: bool) {
-    PREFER_BUNDLED_NODE_RUNTIME.store(prefer, Ordering::Relaxed);
-}
-
-/// 已安装的捆绑运行时 node 二进制（未安装时返回 None）
-pub fn bundled_node_binary(app_handle: &crate::AppHandle) -> Option<PathBuf> {
-    bundled_node_binary_from(
-        &get_node_install_path(app_handle),
-        &dependencies::entry_relative(app_handle, dependencies::DEP_NODE),
-    )
-}
-
-pub(crate) fn bundled_node_binary_from(runtime_dir: &Path, entry: &Path) -> Option<PathBuf> {
-    let direct_path = runtime_dir.join(entry);
-    if direct_path.exists() {
-        return Some(direct_path);
-    }
-    let bin_name = entry.file_name()?.to_string_lossy().into_owned();
-    search_node_binary(&runtime_dir.to_path_buf(), &bin_name)
-}
-
-/// Node.js 二进制路径
-///
-/// 优先级：ABI 探测要求捆绑运行时（原生模块不匹配时的兜底）> 映射表（`null` =
-/// 系统环境 / 路径 = 指定根）> 未记录时沿用「本地版本兼容优先」> 已安装的捆绑运行时。
-pub fn get_node_binary_path(app_handle: &crate::AppHandle) -> PathBuf {
-    node_binary_path_from(
-        &get_node_install_path(app_handle),
-        &dependencies::entry_relative(app_handle, dependencies::DEP_NODE),
-        matches!(
-            dependencies::mapped(app_handle, dependencies::DEP_NODE),
-            Some(Some(_))
-        ),
-    )
-}
-
-pub(crate) fn node_binary_path_from(
-    runtime_dir: &Path,
-    entry: &Path,
-    pinned_managed: bool,
-) -> PathBuf {
-    let target = runtime_dir.join(entry);
-    let bundled = bundled_node_binary_from(runtime_dir, entry);
-
-    if prefer_bundled_node_runtime() {
-        if let Some(bundled) = bundled.clone() {
-            log::debug!(
-                "Using bundled Node.js runtime (native ABI override): {}",
-                bundled.display()
-            );
-            return bundled;
-        }
-        log::warn!(
-            "Bundled Node.js runtime is required by the native module ABI check but is not installed"
-        );
-    }
-
-    if pinned_managed {
-        if let Some(bundled) = bundled.clone() {
-            log::debug!("Using mapped Node.js runtime root: {}", bundled.display());
-            return bundled;
-        }
-    }
-
-    if let Some(local_node) = get_local_node_path() {
-        log::debug!("Using local Node.js: {}", local_node.display());
-        return local_node;
-    }
-
-    bundled.unwrap_or(target)
-}
-
-pub fn get_node_install_path(app_handle: &crate::AppHandle) -> PathBuf {
-    dependencies::active_root(app_handle, dependencies::DEP_NODE)
+/// 拉起进程一律经 [`crate::service::workflow::launch::node_command`]，它由
+/// `ElectronClient` 给出同一个二进制并已带好 Node 模式环境；本函数只服务需要
+/// 提前知道路径的场景（CLI shim 烘焙、诊断展示）。
+pub fn node_executable<R: Runtime>(app_handle: &AppHandle<R>) -> Result<PathBuf, String> {
+    crate::service::workflow::electron_executable(app_handle)
 }
 
 /// Harness 发行版安装目录
@@ -361,6 +236,11 @@ pub fn get_dsh_install_path<R: Runtime>(app_handle: &AppHandle<R>) -> PathBuf {
 /// dsh CLI 入口
 pub fn get_dsh_binary_path<R: Runtime>(app_handle: &AppHandle<R>) -> PathBuf {
     dependencies::binary_path(app_handle, dependencies::DEP_DSH)
+}
+
+/// 指定核心根下的 dsh CLI 入口（槽位与随包内核等非生效根使用）。
+pub fn dsh_binary_at<R: Runtime>(root: &Path, app_handle: &AppHandle<R>) -> PathBuf {
+    dependencies::binary_path_at(app_handle, root, dependencies::DEP_DSH)
 }
 
 /// pnpm 安装目录
@@ -443,9 +323,6 @@ pub fn find_system_git_binary() -> Option<PathBuf> {
 /// 运行 Git 并捕获输出；GUI 进程下禁止闪现控制台窗口。
 #[cfg(windows)]
 fn git_output(binary: &Path, arg: &str) -> Option<std::process::Output> {
-    if let Some(output) = crate::service::workflow::early::probe_output(binary, &[arg], false) {
-        return output.ok();
-    }
     use std::os::windows::process::CommandExt;
 
     std::process::Command::new(binary)
@@ -533,7 +410,20 @@ pub fn git_runtime_ready<R: Runtime>(_app_handle: &AppHandle<R>) -> bool {
 
 /// Harness 发行版清单路径
 pub fn get_dsh_package_json_path<R: Runtime>(app_handle: &AppHandle<R>) -> PathBuf {
-    get_dsh_install_path(app_handle).join(DSH_MANIFEST_RELATIVE)
+    manifest_in(&get_dsh_install_path(app_handle))
+}
+
+/// 托管根里的发行版清单路径：asar 核心的清单在归档内部。
+///
+/// 目录型核心读 `<根>/package.json`；asar 核心读 `<根>/<核心>.asar/package.json`。
+/// 归档不存在（尚未下载 / 旧的目录核心）时退回目录形态，让未安装与诊断路径不变。
+pub fn manifest_in(core_root: &Path) -> PathBuf {
+    match dsh_core_asar_filename() {
+        Ok(name) if core_root.join(&name).is_file() => {
+            core_root.join(name).join(DSH_MANIFEST_RELATIVE)
+        }
+        _ => core_root.join(DSH_MANIFEST_RELATIVE),
+    }
 }
 
 /// 用户主目录（Windows 取 `%USERPROFILE%`，Unix 取 `$HOME`）。
@@ -563,10 +453,10 @@ pub(crate) fn dsh_data_path_from_env() -> PathBuf {
     let dir_name = if cfg!(debug_assertions) {
         DSH_HOME_DEV_DIR_NAME
     } else {
-        if let Some(home) = std::env::var_os("DSH_HOME") {
-            if !home.is_empty() {
-                return PathBuf::from(home);
-            }
+        if let Some(home) = std::env::var_os("DSH_HOME")
+            && !home.is_empty()
+        {
+            return PathBuf::from(home);
         }
         DSH_HOME_DIR_NAME
     };
@@ -599,53 +489,15 @@ pub(crate) fn service_log_path_from(base: &Path, profile: Option<&str>) -> PathB
     }
 }
 
-/// 捆绑的 Node.js 版本号
-pub fn get_bundled_node_version() -> String {
-    NODE_VERSION.trim_start_matches('v').to_string()
-}
-
-/// 当前实际使用的 Node.js 版本号（本地 Node 优先，其次捆绑运行时）
-pub fn get_active_node_version() -> String {
-    // ABI 探测要求捆绑运行时时不能再展示本地 node 版本：界面显示必须与实际
-    // 拉起的服务进程一致（否则用户看到的版本与日志里的运行时对不上）。
-    if !prefer_bundled_node_runtime() {
-        if let Some(local_node) = get_local_node_path() {
-            if let Some(version) = get_node_version_of_path(&local_node) {
-                return version;
-            }
-        }
-    }
-    get_bundled_node_version()
-}
-
-fn parse_node_version(output: &str) -> Option<(u64, u64, u64)> {
-    let version = output.trim().trim_start_matches('v');
-    let mut parts = version.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    let patch = parts.next()?.parse().ok()?;
-    Some((major, minor, patch))
-}
-
-/// 兼容性规则与当前 DSH `engines.node` 一致：v22.19.0+ 或 v24+；v23 不受支持。
-fn is_supported_node_version(version: &str) -> bool {
-    let Some((major, minor, _patch)) = parse_node_version(version) else {
-        return false;
-    };
-    match major {
-        22 => minor >= 19,
-        major if major >= 24 => true,
-        _ => false,
-    }
-}
-
-/// 运行 `node --version` 并判断运行时是否兼容
-pub fn is_runtime_compatible(app_handle: &crate::AppHandle) -> bool {
-    let node = get_node_binary_path(app_handle);
-    if !node.exists() {
-        return false;
-    }
-    get_node_version_of_path(&node).is_some_and(|version| is_supported_node_version(&version))
+/// 当前实际使用的 Node.js 版本号
+///
+/// 运行时只有一个：随包 Electron（Node 模式）。直接探测它自己报告的版本，界面
+/// 展示与实际拉起 dsh 的可执行文件必然一致；探测失败时回落空串（前端显示 `-`）。
+pub fn get_active_node_version<R: Runtime>(app_handle: &AppHandle<R>) -> String {
+    node_executable(app_handle)
+        .ok()
+        .and_then(|node| get_node_version_of_path(&node))
+        .unwrap_or_default()
 }
 
 /// 从打包的 Harness 清单读取 dsh 版本（界面展示用）
@@ -654,8 +506,11 @@ pub fn get_dsh_version<R: Runtime>(app_handle: &AppHandle<R>) -> Option<String> 
 }
 
 pub(crate) fn dsh_version_at(manifest_path: &Path) -> Option<String> {
+    // 归档内的路径必须经 asar 解析：`std::fs` 对 `<核心>.asar/node_modules/...` 一律
+    // ENOENT，直接读会让每次版本判定都落到 tag 兜底，甚至误报「版本未安装」。
     let read = |path: &Path| {
-        serde_json::from_slice::<serde_json::Value>(&fs::read(path).ok()?).ok()
+        super::asar::read_json(path)
+            .or_else(|| serde_json::from_slice::<serde_json::Value>(&fs::read(path).ok()?).ok())
     };
     let manifest = read(manifest_path);
     if let Some(package) = manifest.as_ref().filter(|package| {
@@ -675,7 +530,11 @@ pub(crate) fn dsh_version_at(manifest_path: &Path) -> Option<String> {
                 .get("dependencies")?
                 .get("@deepseek-ai/dsh")?
                 .as_str()
-                .map(|value| value.trim_start_matches(['^', '~', '=', '>', '<']).to_string())
+                .map(|value| {
+                    value
+                        .trim_start_matches(['^', '~', '=', '>', '<'])
+                        .to_string()
+                })
         })
 }
 
@@ -696,7 +555,7 @@ pub fn runtime_info<R: Runtime>(app: &AppHandle<R>, port: u16) -> RuntimeInfo {
     RuntimeInfo {
         app_version: app.package_info().version.to_string(),
         dsh_version: get_dsh_version(app),
-        node_version: get_active_node_version(),
+        node_version: get_active_node_version(app),
         service_url: get_dsh_service_url(port),
         // 用户数据所在目录 = $DSH_HOME（release 为官方 ~/.dsh，debug 为独立
         // ~/.dsh.dev，见 get_dsh_data_path），不再是 AppData
@@ -729,25 +588,6 @@ mod tests {
             }
         });
         assert_eq!(base, expected);
-    }
-
-    #[test]
-    fn bundled_node_resolution_preserves_direct_and_nested_layouts() {
-        let root = tempfile::tempdir().unwrap();
-        let entry = PathBuf::from("bin").join("node");
-        assert_eq!(bundled_node_binary_from(root.path(), &entry), None);
-        let nested = root.path().join("unpacked").join("node.exe");
-        fs::create_dir_all(nested.parent().unwrap()).unwrap();
-        fs::write(&nested, b"fixture").unwrap();
-        assert_eq!(bundled_node_binary_from(root.path(), &entry), Some(nested));
-        let direct = root.path().join(&entry);
-        fs::create_dir_all(direct.parent().unwrap()).unwrap();
-        fs::write(&direct, b"fixture").unwrap();
-        assert_eq!(
-            bundled_node_binary_from(root.path(), &entry),
-            Some(direct.clone())
-        );
-        assert_eq!(node_binary_path_from(root.path(), &entry, true), direct);
     }
 
     #[test]
@@ -804,6 +644,7 @@ mod tests {
         let cache = std::sync::Mutex::new(None);
         let calls = std::sync::atomic::AtomicUsize::new(0);
         let barrier = std::sync::Barrier::new(4);
+        use std::sync::atomic::Ordering;
         std::thread::scope(|scope| {
             for _ in 0..4 {
                 scope.spawn(|| {
@@ -924,7 +765,6 @@ mod tests {
         .unwrap();
         let first = get_node_version_of_path(&node).unwrap();
         assert_eq!(first, "22.19.0");
-        assert!(is_supported_node_version(&first));
         fs::write(root.path().join("version"), "v23.0.0\n").unwrap();
         fs::write(
             root.path().join("identity"),
@@ -933,7 +773,6 @@ mod tests {
         .unwrap();
         let second = get_node_version_of_path(&node).unwrap();
         assert_eq!(second, "23.0.0");
-        assert!(!is_supported_node_version(&second));
         let after = fs::metadata(&node).unwrap();
         assert_eq!(before.len(), after.len());
         assert_eq!(before.modified().unwrap(), after.modified().unwrap());
@@ -962,7 +801,9 @@ mod tests {
 
     #[test]
     fn node_version_cache_executes_the_actual_node_probe_once() {
-        let candidate = find_local_node_binary().expect("Node.js required for version probe tests");
+        let Some(candidate) = crate::service::workflow::test_runtime_executable() else {
+            return;
+        };
         let (_, actual) = probe_node_version(&candidate).expect("working Node.js required");
         let node = actual.expect("Node.js must expose its real executable path");
         let output = node_version_output(&node, &["--version"]).unwrap();
@@ -1086,26 +927,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn node_base_url_switches_on_region() {
-        assert_eq!(node_base_url(Region::Overseas), NODE_BASE_URL);
-        assert_eq!(node_base_url(Region::Domestic), NODE_MIRROR_BASE_URL);
-    }
-
     /// 当前 DSH 明确支持 22.19+ 与 24+，不支持 22.18 及整个 Node 23 系列。
     #[test]
-    fn node_runtime_boundary_matches_current_dsh_engine() {
-        assert!(!is_supported_node_version("v22.18.0"));
-        assert!(is_supported_node_version("v22.19.0"));
-        assert!(!is_supported_node_version("v22.19.0-rc.1"));
-        assert!(!is_supported_node_version("v23.99.0"));
-        assert!(is_supported_node_version("v24.0.0"));
-        assert!(!is_supported_node_version("v24.0.0-nightly.1"));
-    }
-
-    #[test]
     fn mirror_urls_expand_every_prefix() {
-        let asset = "https://github.com/dsh-tauri-desk/deepseek-harness-pkg/releases/download/v1.0.0/deepseek-harness-pkg-windows.zip";
+        let asset = "https://github.com/dsh-tauri/deepseek-harness-pkg/releases/download/v1.0.0/deepseek-harness-pkg-windows.zip";
         let urls = mirror_download_urls(asset);
         assert_eq!(urls.len(), DSH_MIRROR_PREFIXES.len());
         for (url, prefix) in urls.iter().zip(DSH_MIRROR_PREFIXES) {
@@ -1122,15 +947,11 @@ mod tests {
     #[test]
     fn download_urls_keep_platform_filename_shape() {
         // 无论哪个地域，URL 都以 https 开头并保留平台文件名（镜像只是换前缀）
-        let node = get_node_download_url().expect("node url");
-        assert!(node.starts_with("https://"));
-        let filename = node.rsplit('/').next().expect("node url filename");
-        assert!(filename.starts_with(&format!("node-{}", NODE_VERSION)));
-        assert!(filename.ends_with(".zip") || filename.ends_with(".tar.gz"));
-
-        let dsh = get_dsh_download_url().expect("dsh url");
-        assert!(dsh.starts_with("https://"));
-        assert!(dsh.ends_with(".zip"));
+        for core_asar in [true, false] {
+            let dsh = get_dsh_download_url(core_asar).expect("dsh url");
+            assert!(dsh.starts_with("https://"));
+            assert!(dsh.ends_with(if core_asar { ".asar.zip" } else { ".zip" }));
+        }
     }
 
     #[test]
@@ -1162,77 +983,28 @@ mod tests {
 
     #[test]
     fn dsh_pkg_asset_filename_matches_linux_architecture() {
+        // 同一 tag 同时发布两种形态：asar 归档（外层再套一层 zip）与解压后即目录树的 zip。
         assert_eq!(
-            dsh_pkg_asset_filename("linux", "x86_64").unwrap(),
+            dsh_pkg_asset_filename("linux", "x86_64", true).unwrap(),
+            "deepseek-harness-pkg-linux.asar.zip"
+        );
+        assert_eq!(
+            dsh_pkg_asset_filename("linux", "aarch64", true).unwrap(),
+            "deepseek-harness-pkg-linux-arm64.asar.zip"
+        );
+        assert_eq!(
+            dsh_pkg_asset_filename("linux", "x86_64", false).unwrap(),
             "deepseek-harness-pkg-linux.zip"
         );
         assert_eq!(
-            dsh_pkg_asset_filename("linux", "aarch64").unwrap(),
+            dsh_pkg_asset_filename("linux", "aarch64", false).unwrap(),
             "deepseek-harness-pkg-linux-arm64.zip"
         );
-        assert!(dsh_pkg_asset_filename("linux", "riscv64").is_err());
-    }
-
-    #[test]
-    fn node_pkg_filename_covers_all_supported_platforms() {
-        // 与 nodejs.org dist 布局一致（纯函数测试，不受宿主操作系统限制）
-        let cases = [
-            // (os, arch, 期望文件名)
-            (
-                "linux",
-                "x86_64",
-                format!("node-{}-linux-x64.tar.gz", NODE_VERSION),
-            ),
-            (
-                "linux",
-                "aarch64",
-                format!("node-{}-linux-arm64.tar.gz", NODE_VERSION),
-            ),
-            (
-                "windows",
-                "x86_64",
-                format!("node-{}-win-x64.zip", NODE_VERSION),
-            ),
-            (
-                "windows",
-                "aarch64",
-                format!("node-{}-win-x64.zip", NODE_VERSION),
-            ),
-            (
-                "macos",
-                "aarch64",
-                format!("node-{}-darwin-arm64.tar.gz", NODE_VERSION),
-            ),
-            (
-                "macos",
-                "x86_64",
-                format!("node-{}-darwin-x64.tar.gz", NODE_VERSION),
-            ),
-        ];
-        for (os, arch, expected) in cases {
-            assert_eq!(
-                node_pkg_filename(os, arch).expect("supported platform"),
-                expected,
-                "os: {os}, arch: {arch}"
-            );
-        }
-    }
-
-    #[test]
-    fn node_pkg_filename_rejects_unsupported_platform() {
-        // 未知操作系统/架构必须返回带 "Unsupported platform" 前缀的错误
-        let unsupported = [
-            ("freebsd", "x86_64"),
-            ("linux", "riscv64"),
-            ("openbsd", "aarch64"),
-            ("macos", "riscv64"),
-        ];
-        for (os, arch) in unsupported {
-            let err = node_pkg_filename(os, arch).expect_err("unsupported platform");
-            assert!(
-                err.starts_with("Unsupported platform: "),
-                "os: {os}, arch: {arch}, err: {err}"
-            );
-        }
+        assert_eq!(
+            dsh_pkg_asset_stem("linux", "aarch64").unwrap(),
+            "deepseek-harness-pkg-linux-arm64"
+        );
+        assert!(dsh_pkg_asset_filename("linux", "riscv64", true).is_err());
+        assert!(dsh_pkg_asset_filename("linux", "riscv64", false).is_err());
     }
 }

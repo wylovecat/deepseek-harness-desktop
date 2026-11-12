@@ -14,13 +14,30 @@ fn application_context() -> tauri::Context<tauri_runtime_electron::ElectronRunti
     tauri::generate_context!()
 }
 
-/// 对显式给定的核心安装目录施加全套 dsh 补丁（`--patch-core <dir>` 的入口）。
+/// 声明 Windows 任务栏身份，让固定项重启本应用而不是内嵌的 Electron 运行时。
 ///
-/// E2E 的插件 L2 直接起 `dsh web`，不经过桌面端启动路径；没有这一步，被测核心就缺少
-/// 桌面端运行时会打上的补丁（鉴权、渲染器、会话、工作区等），断言的前提不成立。
-/// 因此把补丁集暴露成一个不带 GUI 的入口，让编排复用同一份 Rust 实现，而不是另抄一份。
-pub fn patch_core_dir(core_dir: &std::path::Path) -> Result<(), String> {
-    service::patch::apply_all_at(core_dir)
+/// 图钉由 Windows 按窗口所属进程创建：壳窗口的属主是内嵌运行时进程，缺 relaunch
+/// 命令时只能「裸 exe + 空参数」重启，于是打开 Electron 自带的默认欢迎页（用户
+/// 看到的 `path-to-app`）。这里补上安装器写进快捷方式的同一 AUMID，并把重启命令
+/// 指回主程序，图钉与开始菜单因此指向同一个入口。
+#[cfg(windows)]
+fn declare_taskbar_identity(context: &tauri::Context<tauri_runtime_electron::ElectronRuntime>) {
+    let identifier = context.config().identifier.clone();
+    let display_name = context
+        .config()
+        .product_name
+        .clone()
+        .unwrap_or_else(|| identifier.clone());
+    let Ok(executable) = std::env::current_exe() else {
+        log::warn!("TASKBAR_IDENTITY_FAILED: current executable unavailable");
+        return;
+    };
+    let executable = executable.to_string_lossy();
+    tauri_runtime_electron::set_app_details(
+        identifier,
+        format!("\"{executable}\""),
+        display_name,
+    );
 }
 
 pub fn run() -> Result<(), String> {
@@ -62,18 +79,18 @@ pub fn run() -> Result<(), String> {
         Some(instance) => std::sync::Arc::new(instance),
         None => return Ok(()),
     };
-    let startup = service::workflow::early::Startup::begin(
-        &context,
-        #[cfg(all(windows, not(debug_assertions)))]
-        single_instance.clone(),
-    );
+    // 任务栏固定项按窗口所属进程创建：壳窗口跑在内嵌 Electron 运行时进程里，
+    // 没有 relaunch 命令时 Windows 只能裸启动该 exe，落到 Electron 默认页而不是
+    // 本应用（0.30 用户的「升级后打不开」即此）。显式声明与安装器一致的 AUMID，
+    // 并让重启目标回到主程序。
+    #[cfg(windows)]
+    declare_taskbar_identity(&context);
     desktop::builder()
         .invoke_handler(desktop::handler())
         .build(context)
         .map_err(|error| format!("STARTUP_FAILED: {error}"))?
         .run(move |app_handle, event| match event {
             tauri::RunEvent::Ready => {
-                startup.attach(app_handle);
                 #[cfg(all(windows, not(debug_assertions)))]
                 if let Err(error) = single_instance.attach(app_handle) {
                     log::error!("SINGLE_INSTANCE_ATTACH_FAILED: {error}");
@@ -87,21 +104,34 @@ pub fn run() -> Result<(), String> {
             tauri::RunEvent::Reopen { .. } => {
                 crate::utils::show_main_window(&app_handle);
             }
-            // 正常退出请求发生在窗口销毁之前；此时主动保存一次主窗口几何，
+            // 正常退出请求发生在窗口销毁之前；此时把内存里的窗口几何落盘一次，
             // 避免 Windows 最后一个移动/缩放事件尚未写入就退出而丢失尺寸。
             tauri::RunEvent::ExitRequested { .. } => {
-                config::save_main_window_geometry(app_handle);
+                use tauri_plugin_window_state::AppHandleExt;
+                if let Err(error) =
+                    app_handle.save_window_state(desktop::builder::WINDOW_STATE_FLAGS)
+                {
+                    log::warn!("[window-state] geometry save failed: {error}");
+                }
             }
             // 退出时回收 Harness 进程：不回收的话，node 进程会在应用退出后
             // 残留并把原生模块 DLL（如 sharp 的 libvips-42.dll）锁在内存，
             // 下次启动重新解压时会失败（Windows os error 32）
             tauri::RunEvent::Exit => {
-                startup.shutdown();
                 // 进行中的插件安装子进程是独立进程组，父进程退出不会连带回收；
                 // 不显式结束就会留下占着档案 / pnpm store 的孤儿，让下一次启动
-                // 永久卡在安装阶段（且日志无任何输出）。必须先于其它收尾动作。
+                // 永久卡在安装阶段（且日志无任何输出）。必须先于读取设置：后者与设置
+                // 写入共用一把锁，保存卡在 I/O 上时会把回收一起拖到用户强杀进程之后。
                 service::plugin::terminate_active_installs_blocking();
+                // Exit 在一个进程生命周期内只发生一次，这条日志是「内核为什么被杀」
+                // 的唯一线索：desktop 的 stderr 在 .desktop 启动下会被丢弃（issue #1466）。
                 let setting = config::get_store_dat_setting(app_handle);
+                log::warn!(
+                    "RUN_EVENT_EXIT: installed={} auto_update={} pending_installer={}",
+                    setting.installed,
+                    setting.auto_update,
+                    service::update::pending_installer_path(app_handle).is_some()
+                );
                 if setting.installed {
                     service::workflow::stop_on_exit(app_handle);
                 }
@@ -121,16 +151,4 @@ pub fn run() -> Result<(), String> {
 #[cfg(target_os = "linux")]
 pub(crate) fn shell_window_opaque() -> bool {
     std::env::var_os("DSH_OPAQUE_WINDOW").is_some()
-}
-
-pub(crate) fn pet_overlay_supported_env() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        return desktop::startup::pet_overlay_supported(
-            std::env::var_os("WAYLAND_DISPLAY").is_some(),
-            &std::env::var("TAURI_RUNTIME_ELECTRON_ARGS").unwrap_or_default(),
-        );
-    }
-    #[cfg(not(target_os = "linux"))]
-    true
 }

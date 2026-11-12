@@ -20,23 +20,19 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 
 use super::cancel::terminate_owned_install;
-use super::install::install_internal;
-use super::installed::{installed_name, profile_dir, ProfilePackageJson};
-use super::preset::{
-    bundled_dep_spec, bundled_plugin_dir, load_presets, PreinstallPluginInfo,
-};
-use super::process::{new_process_owner, PreinstallLogPayload, ProcessOwner, PREINSTALL_LOG_EVENT};
+use super::install::{install_internal, trust_policy_rejection};
+use super::installed::{ProfilePackageJson, installed_name, profile_dir};
+use super::preset::{PreinstallPluginInfo, bundled_dep_spec, bundled_plugin_dir, load_presets};
+use super::process::{PREINSTALL_LOG_EVENT, PreinstallLogPayload, ProcessOwner, new_process_owner};
 use crate::config;
-#[cfg(any(windows, test))]
-use super::preset::{bundled_plugin_dir_from, presets_from_manifest};
 
+use manifest::internal_plugin_entry_is_ready;
 use manifest::{
     collect_dangling_local_link_deps, dedupe_profile_bundles, dep_matches_spec,
-    remove_duplicate_bundle_entries_from_patch, remove_internal_plugins_from_manifest,
-    remove_stale_plugin_entry, write_profile_manifest,
+    internal_plugin_entry_problem, remove_duplicate_bundle_entries_from_patch,
+    remove_internal_plugins_from_manifest, remove_stale_plugin_entry, write_profile_manifest,
 };
-pub(crate) use manifest::{internal_plugin_entry_is_ready, skip_unavailable_plugins};
-use materialize::{materialize_links, OfflineLink};
+use materialize::{OfflineLink, materialize_links};
 
 mod manifest;
 mod materialize;
@@ -53,6 +49,10 @@ struct InternalPluginsPhase {
     detail: InternalPluginPhaseDetail,
     completed: usize,
     total: usize,
+    /// 当前正在核对/安装的条目（安装名）。启动卡死时前端据此指名卡在哪个插件，
+    /// 因此只在 checking / installing 且确有当前条目时携带（issue #1503）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entry: Option<String>,
 }
 
 #[derive(serde::Serialize, Clone, Copy)]
@@ -228,13 +228,13 @@ fn repair_loader_state(
 ) -> Result<bool, String> {
     let bundle_ids: HashSet<&str> = internal.iter().map(|preset| preset.id.as_str()).collect();
     let mut pending = false;
-    if let Some(manifest) = manifest.as_mut() {
-        if dedupe_profile_bundles(manifest) {
-            if prepare {
-                write_profile_manifest(&profile.join("package.json"), manifest)?;
-            } else {
-                pending = true;
-            }
+    if let Some(manifest) = manifest.as_mut()
+        && dedupe_profile_bundles(manifest)
+    {
+        if prepare {
+            write_profile_manifest(&profile.join("package.json"), manifest)?;
+        } else {
+            pending = true;
         }
     }
 
@@ -294,7 +294,7 @@ fn repair_loader_state(
             return Err(format!(
                 "INTERNAL_PLUGIN_ROOT_READ_FAILED: {}: {error}",
                 root.display()
-            ))
+            ));
         }
     };
     if existing.as_deref() != Some(EMPTY_ROOT) && profile.is_dir() {
@@ -355,7 +355,6 @@ pub(crate) async fn ensure(app_handle: &AppHandle) -> Result<(), String> {
 }
 
 async fn ensure_scoped(app_handle: &AppHandle) -> Result<(), String> {
-    crate::service::workflow::early::wait_preparation().await?;
     let lock = ensure_lock(&crate::service::profile::active_profile(app_handle));
     let presets = load_presets(app_handle);
     let core_version = crate::service::core::active_version(app_handle);
@@ -374,6 +373,16 @@ async fn ensure_scoped(app_handle: &AppHandle) -> Result<(), String> {
             &config::get_dsh_data_path(app_handle),
             &refs,
             false,
+            |entry: &str| {
+                emit_phase(
+                    app_handle,
+                    "progress",
+                    InternalPluginPhaseDetail::Checking,
+                    0,
+                    refs.len(),
+                    Some(entry),
+                );
+            },
             |id| bundled_plugin_dir(app_handle, id),
         )?;
         return require_running_plugins_ready(&profile, &check);
@@ -429,9 +438,9 @@ async fn subscribe_or_start(
 
                     if !wait_for_owner_release(owner, ENSURE_OWNER_DRAIN_TIMEOUT).await {
                         let reason = format!(
-                        "INTERNAL_PLUGIN_PROCESS_REAP_TIMEOUT: plugin process owner {owner:?} remained active for {} seconds",
-                        ENSURE_OWNER_DRAIN_TIMEOUT.as_secs()
-                    );
+                            "INTERNAL_PLUGIN_PROCESS_REAP_TIMEOUT: plugin process owner {owner:?} remained active for {} seconds",
+                            ENSURE_OWNER_DRAIN_TIMEOUT.as_secs()
+                        );
                         log::error!("{reason}");
                         outcome = Err(reason.clone());
                         let _ = result_tx.send(Some(outcome));
@@ -523,8 +532,8 @@ async fn receive_flight_result(
 /// 取消共享的内置插件安装并等待拥有者完成清理，确保 Retry 不会叠加新进程。
 pub(crate) async fn cancel() -> Result<(), String> {
     let mut result = {
-        let profile =
-            crate::service::workflow::instances::current_profile().unwrap_or_else(|| crate::service::profile::DEFAULT_PROFILE.into());
+        let profile = crate::service::workflow::instances::current_profile()
+            .unwrap_or_else(|| crate::service::profile::DEFAULT_PROFILE.into());
         let lock = ensure_lock(&profile);
         let mut coordinator = lock.lock().await;
         let Some(active) = &coordinator.active else {
@@ -549,7 +558,7 @@ async fn run_ensure_operation(
     internal: &[PreinstallPluginInfo],
     owner: ProcessOwner,
     cancel_tx: tokio::sync::watch::Sender<bool>,
-    mut cancel: tokio::sync::watch::Receiver<bool>,
+    cancel: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
     let total = internal.len();
     emit_phase(
@@ -558,16 +567,29 @@ async fn run_ensure_operation(
         InternalPluginPhaseDetail::Waiting,
         0,
         total,
-    );
-    emit_phase(
-        app_handle,
-        "progress",
-        InternalPluginPhaseDetail::Checking,
-        0,
-        total,
+        None,
     );
     let refs: Vec<_> = internal.iter().collect();
     let operation = ensure_inner(app_handle, &refs, cancel.clone(), owner);
+    wait_for_ensure_operation(
+        operation,
+        total,
+        owner,
+        cancel_tx,
+        cancel,
+        |phase, detail, completed| emit_phase(app_handle, phase, detail, completed, total, None),
+    )
+    .await
+}
+
+async fn wait_for_ensure_operation(
+    operation: impl Future<Output = Result<(), String>>,
+    total: usize,
+    owner: ProcessOwner,
+    cancel_tx: tokio::sync::watch::Sender<bool>,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+    mut emit: impl FnMut(&'static str, InternalPluginPhaseDetail, usize),
+) -> Result<(), String> {
     tokio::pin!(operation);
     let deadline = tokio::time::sleep(ENSURE_ABSOLUTE_TIMEOUT);
     tokio::pin!(deadline);
@@ -577,7 +599,11 @@ async fn run_ensure_operation(
     loop {
         tokio::select! {
             outcome = &mut operation => {
-                emit_phase(app_handle, "done", InternalPluginPhaseDetail::Done, total, total);
+                if outcome.as_ref().is_err_and(|reason| reason.starts_with("INTERNAL_PLUGIN_INSTALL_CANCELLED:")) {
+                    emit("done", InternalPluginPhaseDetail::Cancelled, 0);
+                } else {
+                    emit("done", InternalPluginPhaseDetail::Done, total);
+                }
                 return outcome;
             }
             _ = &mut deadline => {
@@ -588,7 +614,7 @@ async fn run_ensure_operation(
                 if tokio::time::timeout(ENSURE_CLEANUP_TIMEOUT, &mut operation).await.is_err() {
                     log::error!("INTERNAL_PLUGIN_CLEANUP_TIMEOUT: plugin process did not exit after forced termination");
                 }
-                emit_phase(app_handle, "done", InternalPluginPhaseDetail::Timeout, 0, total);
+                emit("done", InternalPluginPhaseDetail::Timeout, 0);
                 return Err(reason.to_string());
             }
             changed = cancel.changed() => {
@@ -599,12 +625,12 @@ async fn run_ensure_operation(
                     if tokio::time::timeout(ENSURE_CLEANUP_TIMEOUT, &mut operation).await.is_err() {
                         log::error!("INTERNAL_PLUGIN_CLEANUP_TIMEOUT: plugin process did not exit after forced termination");
                     }
-                    emit_phase(app_handle, "done", InternalPluginPhaseDetail::Cancelled, 0, total);
+                    emit("done", InternalPluginPhaseDetail::Cancelled, 0);
                     return Err(reason.to_string());
                 }
             }
             _ = heartbeat.tick() => {
-                emit_phase(app_handle, "progress", InternalPluginPhaseDetail::Heartbeat, 0, total);
+                emit("progress", InternalPluginPhaseDetail::Heartbeat, 0);
             }
         }
     }
@@ -616,6 +642,7 @@ fn emit_phase(
     detail: InternalPluginPhaseDetail,
     completed: usize,
     total: usize,
+    entry: Option<&str>,
 ) {
     crate::service::workflow::instances::emit(
         app_handle,
@@ -625,25 +652,27 @@ fn emit_phase(
             detail,
             completed,
             total,
+            entry: entry.map(str::to_string),
         },
     );
 }
 
 struct InternalPluginCheck {
     manifest: Option<serde_json::Value>,
-    #[cfg(any(windows, test))]
-    parsed: Option<ProfilePackageJson>,
     need: Vec<(String, String, PathBuf)>,
     orphans: Vec<String>,
     sources_ready: bool,
     migration_pending: bool,
 }
 
+/// on_entry 在每个条目真正开始核对前被调用（启动页据此指名当前条目，见 issue #1503）；
+/// 只报名字，不参与任何判定。
 fn prepare_internal_plugins(
     profile: &Path,
     dsh_home: &Path,
     internal: &[&PreinstallPluginInfo],
     prepare: bool,
+    on_entry: impl Fn(&str),
     resolve_bundle: impl Fn(&str) -> Option<PathBuf>,
 ) -> Result<InternalPluginCheck, String> {
     let manifest_path = profile.join("package.json");
@@ -655,16 +684,16 @@ fn prepare_internal_plugins(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(format!("INTERNAL_PLUGIN_MANIFEST_READ_FAILED: {e}")),
     };
-    let parsed = manifest
-        .as_ref()
-        .map(|value| serde_json::from_value::<ProfilePackageJson>(value.clone()))
-        .transpose()
-        .map_err(|error| format!("INTERNAL_PLUGIN_MANIFEST_SCHEMA_FAILED: {error}"))?;
     if prepare {
         crate::service::perm::ensure_writable_path(profile, dsh_home, "PROFILE_NOT_WRITABLE")?;
     }
     let mut migration_pending =
         repair_loader_state(profile, dsh_home, internal, &mut manifest, prepare)?;
+    let parsed = manifest
+        .as_ref()
+        .map(|value| serde_json::from_value::<ProfilePackageJson>(value.clone()))
+        .transpose()
+        .map_err(|error| format!("INTERNAL_PLUGIN_MANIFEST_SCHEMA_FAILED: {error}"))?;
     let empty_dependencies = HashMap::new();
     let dependencies = parsed
         .as_ref()
@@ -683,16 +712,25 @@ fn prepare_internal_plugins(
     let mut skipped = HashSet::new();
     for preset in internal {
         let name = installed_name(preset);
-        if super::disable::has_patch_disable(&profile, &preset.id)
-            || super::disable::has_patch_disable(&profile, name)
+        if super::disable::has_patch_disable(profile, &preset.id)
+            || super::disable::has_patch_disable(profile, name)
         {
             continue;
         }
         let entry = profile.join("node_modules").join(name);
-        let link_ok = internal_plugin_entry_is_ready(&entry);
+        on_entry(name);
+        let entry_problem = internal_plugin_entry_problem(&entry);
+        let link_ok = entry_problem.is_none();
         let bundled = resolve_bundle(&preset.id);
-        let Some(bundled) = bundled.filter(|source| internal_plugin_entry_is_ready(source)) else {
-            log::warn!("INTERNAL_PLUGIN_SOURCE_MISSING: {name}: bundled manifest or host entry unavailable, skipping repair (installed_ready={link_ok})");
+        let source_ready = bundled
+            .as_deref()
+            .map(internal_plugin_entry_problem)
+            .unwrap_or_else(|| Some("INTERNAL_PLUGIN_SOURCE_ABSENT: no bundled directory".into()));
+        let Some(bundled) = bundled.filter(|_| source_ready.is_none()) else {
+            log::warn!(
+                "INTERNAL_PLUGIN_SOURCE_MISSING: {name}: bundled manifest or host entry unavailable, skipping repair (installed_ready={link_ok}, installed_entry={}, installed_problem={entry_problem:?}, bundled_problem={source_ready:?})",
+                entry.display()
+            );
             sources_ready = false;
             if !link_ok {
                 skipped.insert(name);
@@ -704,14 +742,9 @@ fn prepare_internal_plugins(
         // ① 依赖声明：未声明，或声明的值不再指向当前捆绑目录（路径变更/被改
         // 写）→ 重装；② 依赖真实性：node_modules 链接/拷贝须真实存在（用户
         // 手动清过 node_modules 时声明可能残留但产物已不在）→ 重装。
-        let dep_ok = dependencies
-            .get(&name)
-            .is_some_and(|actual| dep_matches_spec(actual, &expected));
+        let declared = dependencies.get(&name);
+        let dep_ok = declared.is_some_and(|actual| dep_matches_spec(actual, &expected));
 
-        // ③ 挂载登记：`dsh.profile.bundles` 缺项时插件从不挂载——宿主插件的 apply
-        // （含 dsh-tauri 的载体鉴权 gate）不运行，索引恒 401、健康检查永远
-        // `boot page returned 401`。这种「依赖在、bundle 没登记」的半残状态必须判为
-        // 需重装：只按 deps/link 判定会把它当成就绪，装过一次后永远修不回来。
         let bundle_ok = manifest
             .as_ref()
             .and_then(|value| value.pointer("/dsh/profile/bundles"))
@@ -723,7 +756,8 @@ fn prepare_internal_plugins(
             });
         if !dep_ok || !link_ok || !bundle_ok {
             log::info!(
-                "INTERNAL_PLUGIN_NEEDS_REINSTALL: {name}（dep_ok={dep_ok}, link_ok={link_ok}, bundle_ok={bundle_ok}, expected={expected}）"
+                "INTERNAL_PLUGIN_NEEDS_REINSTALL: {name}（dep_ok={dep_ok}, actual={declared:?}, expected={expected}, link_ok={link_ok}, entry={}, problem={entry_problem:?}, bundle_ok={bundle_ok}）",
+                entry.display()
             );
             // 应用升级会移动 `.app` 内的捆绑目录，旧 profile 可能留下指向上个
             // 版本资源的悬空链接。pnpm 在处理这些入口时会在真正改写依赖前以
@@ -732,27 +766,19 @@ fn prepare_internal_plugins(
             need.push((preset.id.clone(), name, entry));
         }
     }
-    if let Some(value) = manifest.as_mut() {
-        if manifest::remove_internal_plugin_bundles(value, &skipped) {
-            if prepare {
-                write_profile_manifest(&manifest_path, value)?;
-            } else {
-                migration_pending = true;
-            }
+    if let Some(value) = manifest.as_mut()
+        && manifest::remove_internal_plugin_bundles(value, &skipped)
+    {
+        if prepare {
+            write_profile_manifest(&manifest_path, value)?;
+        } else {
+            migration_pending = true;
         }
     }
-    #[cfg(any(windows, test))]
-    let parsed = manifest
-        .as_ref()
-        .map(|value| serde_json::from_value::<ProfilePackageJson>(value.clone()))
-        .transpose()
-        .map_err(|error| format!("INTERNAL_PLUGIN_MANIFEST_SCHEMA_FAILED: {error}"))?;
     orphans.sort();
     orphans.dedup();
     Ok(InternalPluginCheck {
         manifest,
-        #[cfg(any(windows, test))]
-        parsed,
         need,
         orphans,
         sources_ready,
@@ -776,7 +802,11 @@ fn require_running_plugins_ready(
     {
         return Err(format!(
             "INTERNAL_PLUGIN_RESTART_REQUIRED: 内置插件需要修复；请停止当前服务后通过正常启动重试（need={:?}, orphans={:?}, migration={}, sources_ready={}, fallback={}）。",
-            check.need.iter().map(|(id, _, _)| id.as_str()).collect::<Vec<_>>(),
+            check
+                .need
+                .iter()
+                .map(|(id, _, _)| id.as_str())
+                .collect::<Vec<_>>(),
             check.orphans,
             check.migration_pending,
             check.sources_ready,
@@ -786,83 +816,40 @@ fn require_running_plugins_ready(
     Ok(())
 }
 
-#[cfg(any(windows, test))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EarlyPluginState {
-    Ready,
-    Defer,
-}
-
-#[cfg(any(windows, test))]
-pub(crate) fn prepare_early_plugins(
-    profile: &Path,
-    dsh_home: &Path,
-    resources: Option<&Path>,
-    manifest: Option<&config::manifest::Manifest>,
-    core_version: Option<&str>,
-) -> Result<EarlyPluginState, String> {
-    let Some(manifest) = manifest.filter(|manifest| !manifest.plugins.built_in.is_empty()) else {
-        return Ok(EarlyPluginState::Defer);
-    };
-    let presets = presets_from_manifest(manifest, resources);
-    prepare_early_plugins_from(profile, dsh_home, &presets, core_version, |id| {
-        bundled_plugin_dir_from(resources, id)
-    })
-}
-
-#[cfg(any(windows, test))]
-fn prepare_early_plugins_from(
-    profile: &Path,
-    dsh_home: &Path,
-    presets: &[PreinstallPluginInfo],
-    core_version: Option<&str>,
+async fn prepare_internal_plugins_for_install(
+    resolve_paths: impl FnOnce() -> (PathBuf, PathBuf),
+    internal: &[&PreinstallPluginInfo],
+    cancel: &tokio::sync::watch::Receiver<bool>,
+    on_entry: &(dyn Fn(&str) + Sync),
     resolve_bundle: impl Fn(&str) -> Option<PathBuf>,
-) -> Result<EarlyPluginState, String> {
-    if presets.is_empty()
-        || presets.iter().any(|preset| {
-            matches!(
-                preset.version,
-                Some(config::manifest::PluginVersion::Matrix(_))
-            )
-        }) && !core_version.is_some_and(|version| semver::Version::parse(version).is_ok())
-    {
-        return Ok(EarlyPluginState::Defer);
-    }
-    let internal: Vec<_> = presets
-        .iter()
-        .filter(|preset| preset.internal && !preset.unsupported_on(core_version))
-        .collect();
-    let check = prepare_internal_plugins(profile, dsh_home, &internal, true, resolve_bundle)?;
-    let Some(parsed) = check.parsed.as_ref() else {
-        return Ok(EarlyPluginState::Defer);
+) -> Result<
+    (
+        tokio::sync::OwnedMutexGuard<()>,
+        PathBuf,
+        InternalPluginCheck,
+    ),
+    String,
+> {
+    let mut cancel_wait = cancel.clone();
+    let operation = tokio::select! {
+        operation = super::process::acquire_operation_lock() => operation?,
+        _ = cancel_wait.wait_for(|cancelled| *cancelled) => {
+            return Err("INTERNAL_PLUGIN_INSTALL_CANCELLED: plugin install was cancelled".into());
+        }
     };
-    if !check.sources_ready
-        || !check.need.is_empty()
-        || !check.orphans.is_empty()
-        || profile
-            .join(".dsh-module-fallback")
-            .try_exists()
-            .map_err(|error| format!("INTERNAL_PLUGIN_FALLBACK_READ_FAILED: {error}"))?
-    {
-        return Ok(EarlyPluginState::Defer);
+    if *cancel.borrow() {
+        return Err("INTERNAL_PLUGIN_INSTALL_CANCELLED: plugin install was cancelled".into());
     }
-    let bundles = parsed
-        .dsh
-        .as_ref()
-        .and_then(|dsh| dsh.profile.as_ref())
-        .map(|profile| profile.bundles.as_slice())
-        .unwrap_or_default();
-    if !super::verify::missing_plugin_ids(
-        &presets,
-        &parsed.dependencies,
-        bundles,
-        &profile.join("node_modules"),
-    )
-    .is_empty()
-    {
-        return Ok(EarlyPluginState::Defer);
-    }
-    Ok(EarlyPluginState::Ready)
+    let (profile, dsh_home) = resolve_paths();
+    let check = prepare_internal_plugins(
+        &profile,
+        &dsh_home,
+        internal,
+        true,
+        on_entry,
+        resolve_bundle,
+    )?;
+    Ok((operation, profile, check))
 }
 
 async fn ensure_inner(
@@ -871,23 +858,38 @@ async fn ensure_inner(
     cancel: tokio::sync::watch::Receiver<bool>,
     owner: ProcessOwner,
 ) -> Result<(), String> {
-    let profile = profile_dir(app_handle);
     if *cancel.borrow() {
         return Err("INTERNAL_PLUGIN_INSTALL_CANCELLED: plugin install was cancelled".into());
     }
+    let (operation, profile, check) = prepare_internal_plugins_for_install(
+        || {
+            (
+                profile_dir(app_handle),
+                config::get_dsh_data_path(app_handle),
+            )
+        },
+        internal,
+        &cancel,
+        &|entry: &str| {
+            emit_phase(
+                app_handle,
+                "progress",
+                InternalPluginPhaseDetail::Checking,
+                0,
+                internal.len(),
+                Some(entry),
+            );
+        },
+        |id| bundled_plugin_dir(app_handle, id),
+    )
+    .await?;
     let manifest_path = profile.join("package.json");
     let InternalPluginCheck {
         mut manifest,
         need,
         orphans,
         ..
-    } = prepare_internal_plugins(
-        &profile,
-        &config::get_dsh_data_path(app_handle),
-        internal,
-        true,
-        |id| bundled_plugin_dir(app_handle, id),
-    )?;
+    } = check;
     if !orphans.is_empty() {
         log::info!("Uninstalling orphaned internal preset plugins: {orphans:?}");
         for name in &orphans {
@@ -923,13 +925,6 @@ async fn ensure_inner(
 
     let ids: Vec<String> = need.iter().map(|(id, _, _)| id.clone()).collect();
     log::info!("Reinstalling internal preset plugins: {ids:?}");
-    emit_phase(
-        app_handle,
-        "progress",
-        InternalPluginPhaseDetail::Installing,
-        0,
-        ids.len(),
-    );
 
     // pnpm add 会先解析清单里的所有既有依赖。0.9.0 将随包目录从
     // `preset-plugins` 迁至 `internal-plugins` 后，旧 file:/link: 路径已不存在，pnpm
@@ -952,10 +947,20 @@ async fn ensure_inner(
     // dep_ok=false 再装，形成不可恢复的启动死循环。保留健康链接，交给本轮 `dsh plugin
     // add` 重写依赖声明即可（pnpm 处理 link: 依赖时会自行覆盖旧入口）。
     let mut entries = HashSet::new();
-    for (_, _, entry) in &need {
+    for (_, name, entry) in &need {
         if !entries.insert(entry.clone()) {
             continue;
         }
+        // pnpm 把整批 id 一次性交给子进程，逐条上报是为了让启动页在整个安装
+        // 期间都有条目可指名；heartbeat 会沿用最后一条原因（issue #1503）。
+        emit_phase(
+            app_handle,
+            "progress",
+            InternalPluginPhaseDetail::Installing,
+            0,
+            ids.len(),
+            Some(name),
+        );
         if internal_plugin_entry_is_ready(entry) {
             log::info!(
                 "INTERNAL_PLUGIN_ENTRY_HEALTHY: keeping intact link {} (no delete + recreate)",
@@ -972,21 +977,32 @@ async fn ensure_inner(
     }
     // 复用常规安装编排（环境准备/补齐 pnpm/`dsh plugin add file:<dir>`）；
     // 启动阶段无持有进程，install 内部不会停服务。失败同样交给调用方告警。
-    let install_result = install_internal(app_handle, &ids, cancel, owner).await;
+    let install_result = install_internal(app_handle, &ids, cancel, owner, &operation).await;
+    let (_process, install_result) = finish_internal_install(install_result).await?;
     if let Err(e) = install_result {
         // 即使 pnpm 失败也清掉旧 fallback，下一次重试必须从干净入口开始。
         remove_legacy_profile_module_fallback_best_effort(&profile);
-        // pnpm 的 `link:` 安装路径在「建好目录链接后立刻回读 package.json」这一步
-        // 失败时（libuv UV_UNKNOWN / 退出码 -4094）可能是**环境性的恒定失败**
-        // （实时防护 / 云盘 / 重解析点过滤驱动），重试与重装都无法越过；此时改由
-        // 桌面端自建链接并补齐清单，让内置插件落盘、启动继续，而不是把应用永久
-        // 卡在 Plugin installation 阶段（见 [`materialize`]）。
-        if is_link_materialization_failure(&e, &need) {
+        // 两类**与内置插件本身无关**的 pnpm 失败都不该让启动自愈永久卡住：前者是
+        // pnpm 的 `link:` 入口回读失败（libuv UV_UNKNOWN / 退出码 -4094，实时防护、
+        // 云盘、重解析点过滤驱动等环境因素，重试与重装都越不过），后者是 pnpm 11 的
+        // lockfile 供应链校验（`ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION`）把档案里
+        // **已声明**的条目按发布时间判成违规，于是每一次插件操作都在这里硬失败
+        // （issue #1348：内置插件每轮被打回，dsh-taiwind 永不落盘、界面错位）。
+        // 内置插件的产物就随包分发，本不需要 registry 复核，因此统一改由桌面端自建
+        // 链接并补齐清单（见 [`materialize`]）。
+        let offline_reason = if is_supply_chain_policy_failure(&e) {
+            Some("[harness] pnpm 的供应链校验拒绝了档案锁文件，内置插件改由应用直接建立链接…")
+        } else if is_link_materialization_failure(&e, &need) {
+            Some("[harness] pnpm 未把插件链接落盘，改由应用直接建立链接…")
+        } else {
+            None
+        };
+        if let Some(line) = offline_reason {
             crate::service::workflow::instances::emit(
                 app_handle,
                 PREINSTALL_LOG_EVENT,
                 PreinstallLogPayload {
-                    line: "[harness] pnpm 未把插件链接落盘，改由应用直接建立链接…".to_string(),
+                    line: line.to_string(),
                 },
             );
             match materialize_internal_links(app_handle, &profile, &need) {
@@ -1035,6 +1051,19 @@ async fn ensure_inner(
     }
 
     Ok(())
+}
+
+async fn finish_internal_install(
+    result: Result<(), String>,
+) -> Result<(tokio::sync::OwnedMutexGuard<()>, Result<(), String>), String> {
+    let process = super::process::acquire_process_lock().await?;
+    if result.as_ref().is_err_and(|reason| {
+        reason.starts_with("PLUGIN_OPERATION_CANCELLED:")
+            || reason.starts_with("INTERNAL_PLUGIN_INSTALL_CANCELLED:")
+    }) {
+        return Err("INTERNAL_PLUGIN_INSTALL_CANCELLED: plugin install was cancelled".into());
+    }
+    Ok((process, result))
 }
 
 /// 安装后仍未真实落盘的内置插件入口（`node_modules/<name>/package.json` 不可读）。
@@ -1098,6 +1127,24 @@ fn looks_like_link_readback_failure(error: &str) -> bool {
     lower.contains("preinstall_failed")
         && lower.contains("node_modules")
         && (lower.contains("code -4094") || lower.contains("unknown error, open"))
+}
+
+/// pnpm 的 lockfile 供应链校验（`minimumReleaseAge`）把档案里**已声明**的条目按发布
+/// 时间判成违规——每一次插件操作都会在这里硬失败，与内置插件的产物本身无关（包目录
+/// 随安装包分发）。因此这类失败同样改走离线自建链接，而不是把启动自愈卡死（#1348）。
+///
+/// 两种可观测形态都认：`install` 解析出精确条目时返回 `PLUGIN_POLICY_BLOCKED: [...]`；
+/// 解析不出条目（pnpm 文案改版、违规条目来自用户自己的依赖）时只剩 pnpm 的原始输出
+/// `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION` / `Lockfile failed supply-chain policy check`。
+fn is_supply_chain_policy_failure(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    // 同一句标题也用于信任降级（用户自己的依赖被降级），那不是发布时间门禁，不能绕过
+    if trust_policy_rejection(error) {
+        return false;
+    }
+    lower.contains("plugin_policy_blocked:")
+        || lower.contains("err_pnpm_minimum_release_age_violation")
+        || lower.contains("lockfile failed supply-chain policy check")
 }
 
 /// 同类签名但诊断里读不到失败路径：无从确认失败的就是内置插件入口。
@@ -1300,6 +1347,254 @@ fn is_legacy_profile_fallback_target(target: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn profile_reset_waits_for_internal_preparation_and_finalization() {
+        use std::time::Duration;
+
+        let _test_guard = super::super::process::TEST_PROCESS_LOCK.lock().await;
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path().to_path_buf();
+        let profile = root.join("profile");
+        let source = root.join("source");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("package.json"), br#"{"name":"builtin"}"#).unwrap();
+        let manifest_path = profile.join("package.json");
+        std::fs::write(
+            &manifest_path,
+            br#"{"dependencies":{"builtin":"1.0.0"},"dsh":{"profile":{"bundles":["builtin","builtin"]}}}"#,
+        )
+        .unwrap();
+        let marker = profile.join("plugin-state");
+        std::fs::write(&marker, "installed").unwrap();
+        let (_cancel_tx, cancel) = tokio::sync::watch::channel(false);
+        let (entered_tx, mut entered) = tokio::sync::mpsc::unbounded_channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let runtime = tokio::runtime::Handle::current();
+        let preparation_root = root.clone();
+        let preparation = tokio::task::spawn_blocking(move || {
+            let preset = builtin("builtin");
+            runtime.block_on(prepare_internal_plugins_for_install(
+                || (profile, preparation_root),
+                &[&preset],
+                &cancel,
+                &|_: &str| {},
+                |_| {
+                    entered_tx.send(()).unwrap();
+                    wait.recv_timeout(Duration::from_secs(10)).unwrap();
+                    Some(source.clone())
+                },
+            ))
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let prepared: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(
+            prepared["dsh"]["profile"]["bundles"],
+            serde_json::json!(["builtin"])
+        );
+        let mut reset = Box::pin(async {
+            let mutation = crate::service::profile::mutation::acquire().await.unwrap();
+            mutation
+                .spawn_blocking("profile".into(), move || {
+                    crate::service::profile::reset_with_root(&root, "profile")
+                })
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut reset)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "installed");
+        release.send(()).unwrap();
+        let (operation, _, check) = tokio::time::timeout(Duration::from_secs(5), preparation)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(check.need.len(), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut reset)
+                .await
+                .is_err()
+        );
+        drop(operation);
+        tokio::time::timeout(Duration::from_secs(5), reset)
+            .await
+            .unwrap();
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn cancelled_internal_preparation_does_not_repair_after_waiting_for_operation() {
+        use std::time::Duration;
+
+        let _test_guard = super::super::process::TEST_PROCESS_LOCK.lock().await;
+        let scratch = tempfile::tempdir().unwrap();
+        let profile = scratch.path().join("profile");
+        std::fs::create_dir_all(&profile).unwrap();
+        let manifest = br#"{"dsh":{"profile":{"bundles":["builtin","builtin"]}}}"#;
+        std::fs::write(profile.join("package.json"), manifest).unwrap();
+        let operation = super::super::process::acquire_operation_lock()
+            .await
+            .unwrap();
+        let (cancel_tx, cancel) = tokio::sync::watch::channel(false);
+        let preset = builtin("builtin");
+        let presets = [&preset];
+        let mut preparation = Box::pin(prepare_internal_plugins_for_install(
+            || (profile.clone(), scratch.path().to_path_buf()),
+            &presets,
+            &cancel,
+            &|_: &str| {},
+            |_| None,
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut preparation)
+                .await
+                .is_err()
+        );
+        cancel_tx.send(true).unwrap();
+        let mut seen_cancel = cancel.clone();
+        assert!(*seen_cancel.borrow_and_update());
+        let mut phases = Vec::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_ensure_operation(
+                async { preparation.await.map(|_| ()) },
+                presets.len(),
+                new_process_owner(),
+                cancel_tx,
+                seen_cancel,
+                |phase, detail, completed| {
+                    phases.push(
+                        serde_json::to_value(InternalPluginsPhase {
+                            phase,
+                            detail,
+                            completed,
+                            total: presets.len(),
+                            entry: None,
+                        })
+                        .unwrap(),
+                    );
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.err().unwrap(),
+            "INTERNAL_PLUGIN_INSTALL_CANCELLED: plugin install was cancelled"
+        );
+        assert_eq!(
+            phases,
+            vec![serde_json::json!({
+                "phase": "done",
+                "detail": "cancelled",
+                "completed": 0,
+                "total": presets.len(),
+            })]
+        );
+        assert_eq!(
+            std::fs::read(profile.join("package.json")).unwrap(),
+            manifest
+        );
+        drop(operation);
+    }
+
+    #[tokio::test]
+    async fn cancelled_installation_waits_for_cleanup_and_reports_cancelled() {
+        use std::time::Duration;
+
+        let _test_guard = super::super::process::TEST_PROCESS_LOCK.lock().await;
+        for reason in [
+            "PLUGIN_OPERATION_CANCELLED: plugin operation was cancelled",
+            "INTERNAL_PLUGIN_INSTALL_CANCELLED: plugin install was cancelled",
+        ] {
+            let process = super::super::process::acquire_process_lock().await.unwrap();
+            let mut finishing = Box::pin(finish_internal_install(Err(reason.to_string())));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), &mut finishing)
+                    .await
+                    .is_err()
+            );
+            let (cancel_tx, mut cancel) = tokio::sync::watch::channel(true);
+            assert!(*cancel.borrow_and_update());
+            let mut phases = Vec::new();
+            drop(process);
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                wait_for_ensure_operation(
+                    async {
+                        let (_process, result) = finishing.await?;
+                        result
+                    },
+                    1,
+                    new_process_owner(),
+                    cancel_tx,
+                    cancel,
+                    |phase, detail, completed| {
+                        phases.push(
+                            serde_json::to_value(InternalPluginsPhase {
+                                phase,
+                                detail,
+                                completed,
+                                total: 1,
+                                entry: None,
+                            })
+                            .unwrap(),
+                        );
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+            let error = result.unwrap_err();
+            assert!(error.starts_with("INTERNAL_PLUGIN_INSTALL_CANCELLED:"));
+            assert!(super::super::process::is_internal_plugin_startup_failure(
+                &error
+            ));
+            assert_eq!(
+                phases,
+                vec![serde_json::json!({
+                    "phase": "done",
+                    "detail": "cancelled",
+                    "completed": 0,
+                    "total": 1,
+                })]
+            );
+            let process = tokio::time::timeout(
+                Duration::from_secs(5),
+                super::super::process::acquire_process_lock(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            drop(process);
+        }
+        for expected in [Ok(()), Err("PLUGIN_POLICY_BLOCKED: untrusted".to_string())] {
+            let (process, result) = finish_internal_install(expected.clone()).await.unwrap();
+            assert_eq!(result, expected);
+            let mut next = Box::pin(super::super::process::acquire_process_lock());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), &mut next)
+                    .await
+                    .is_err()
+            );
+            drop(process);
+            let process = tokio::time::timeout(Duration::from_secs(5), next)
+                .await
+                .unwrap()
+                .unwrap();
+            drop(process);
+        }
+    }
+
     fn builtin(id: &str) -> PreinstallPluginInfo {
         PreinstallPluginInfo {
             id: id.into(),
@@ -1350,6 +1645,7 @@ mod tests {
                 root.path(),
                 &[&presets[0], &presets[1]],
                 true,
+                &|_: &str| {},
                 |id| {
                     Some(if id == "builtin" {
                         source.clone()
@@ -1387,6 +1683,44 @@ mod tests {
     }
 
     #[test]
+    fn entry_reports_every_checked_internal_plugin_in_order() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("profiles/test");
+        std::fs::create_dir_all(&profile).unwrap();
+        for id in ["dsh-tauri", "dsh-tauri-ui"] {
+            let source = root.path().join(id);
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::write(source.join("package.json"), br#"{"name":"x"}"#).unwrap();
+        }
+        let ready = profile.join("node_modules/dsh-tauri");
+        std::fs::create_dir_all(&ready).unwrap();
+        std::fs::write(ready.join("package.json"), br#"{"name":"dsh-tauri"}"#).unwrap();
+        std::fs::write(
+            profile.join("package.json"),
+            serde_json::json!({
+                "dependencies": { "dsh-tauri": bundled_dep_spec(&root.path().join("dsh-tauri")) },
+                "dsh": { "profile": { "bundles": ["dsh-tauri"] } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let presets = [builtin("dsh-tauri"), builtin("dsh-tauri-ui")];
+        let seen = std::cell::RefCell::new(Vec::new());
+
+        prepare_internal_plugins(
+            &profile,
+            root.path(),
+            &[&presets[0], &presets[1]],
+            false,
+            &|name: &str| seen.borrow_mut().push(name.to_string()),
+            |id| Some(root.path().join(id)),
+        )
+        .unwrap();
+
+        assert_eq!(*seen.borrow(), vec!["dsh-tauri", "dsh-tauri-ui"]);
+    }
+
+    #[test]
     fn dev_plugin_sources_missing_preserves_healthy_installed_copy() {
         let root = tempfile::tempdir().unwrap();
         let profile = root.path().join("profiles/test");
@@ -1406,6 +1740,7 @@ mod tests {
             root.path(),
             &[&presets[0], &presets[1]],
             false,
+            &|_: &str| {},
             |_| None,
         )
         .unwrap();
@@ -1420,6 +1755,7 @@ mod tests {
             root.path(),
             &[&presets[0], &presets[1]],
             true,
+            &|_: &str| {},
             |_| None,
         )
         .unwrap();
@@ -1498,20 +1834,12 @@ mod tests {
                     assert_eq!(std::fs::read(&path).unwrap(), bytes);
                 }
 
-                let recovery_profile = if home_layer {
-                    let safe = home.join("profiles/safe");
-                    std::fs::create_dir_all(&safe).unwrap();
-                    safe
-                } else {
-                    profile
-                };
-                let report =
-                    super::super::patch_guard::quarantine_patch_layers_in(&recovery_profile, home);
+                let report = super::super::patch_guard::quarantine_patch_layers_in(&profile, home);
                 assert!(!report.has_failures(), "{report:?}");
                 assert_eq!(report.quarantined.len(), 1);
                 assert_eq!(std::fs::read(&report.quarantined[0].backup).unwrap(), bytes);
                 assert_eq!(
-                    repair_loader_state(&recovery_profile, home, &[], &mut None, true),
+                    repair_loader_state(&profile, home, &[], &mut None, true),
                     Ok(false)
                 );
             }
@@ -1569,166 +1897,6 @@ mod tests {
     }
 
     #[test]
-    fn early_prepare_uses_normal_kernel_and_defers_repairs_without_installing() {
-        let root = tempfile::tempdir().unwrap();
-        let profile = root.path().join("profiles/web");
-        let source = root.path().join("resources/builtin");
-        let entry = profile.join("node_modules/builtin");
-        std::fs::create_dir_all(&source).unwrap();
-        std::fs::create_dir_all(&entry).unwrap();
-        std::fs::write(source.join("package.json"), "{}").unwrap();
-        std::fs::write(entry.join("package.json"), "{}").unwrap();
-        let preset = |id: &str, internal| PreinstallPluginInfo {
-            id: id.into(),
-            spec: id.into(),
-            internal,
-            package: None,
-            version: None,
-            name: id.into(),
-            description: String::new(),
-            repo_url: String::new(),
-            recommended: false,
-            fix: false,
-            default_checked: false,
-            default_unchecked: false,
-            win_only: false,
-        };
-        let presets = vec![preset("builtin", true), preset("community", false)];
-        let path = profile.join("package.json");
-        let healthy = serde_json::json!({
-            "dependencies": {"builtin": bundled_dep_spec(&source)},
-            "dsh": {"profile": {"bundles": ["builtin", "builtin"]}}
-        });
-        let check = |manifest: &serde_json::Value| {
-            std::fs::write(&path, manifest.to_string()).unwrap();
-            prepare_early_plugins_from(&profile, root.path(), &presets, None, |_| {
-                Some(source.clone())
-            })
-        };
-        std::fs::write(
-            profile.join("cordis.patch.yml"),
-            "- insert:\n  - id: builtin\n  - id: user-plugin\n",
-        )
-        .unwrap();
-        assert_eq!(check(&healthy).unwrap(), EarlyPluginState::Ready);
-        let migrated: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(
-            migrated["dsh"]["profile"]["bundles"],
-            serde_json::json!(["builtin"])
-        );
-        assert!(std::fs::read_to_string(profile.join("cordis.patch.yml"))
-            .unwrap()
-            .contains("user-plugin"));
-        assert_eq!(
-            prepare_early_plugins_from(&profile, root.path(), &presets, None, |_| {
-                Some(source.clone())
-            })
-            .unwrap(),
-            EarlyPluginState::Ready
-        );
-        let running_root = "- id: builtin\n  name: runtime-composed\n";
-        std::fs::write(profile.join("cordis.yml"), running_root).unwrap();
-        let running_check = || {
-            prepare_internal_plugins(&profile, root.path(), &[&presets[0]], false, |_| {
-                Some(source.clone())
-            })
-        };
-        let running = running_check().unwrap();
-        require_running_plugins_ready(&profile, &running).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(profile.join("cordis.yml")).unwrap(),
-            running_root
-        );
-        let mut needs_repair = migrated.clone();
-        needs_repair["dsh"]["profile"]["bundles"] = serde_json::json!([]);
-        std::fs::write(&path, needs_repair.to_string()).unwrap();
-        let running = running_check().unwrap();
-        assert_eq!(
-            running
-                .need
-                .iter()
-                .map(|(id, _, _)| id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["builtin"]
-        );
-        assert!(require_running_plugins_ready(&profile, &running)
-            .unwrap_err()
-            .starts_with("INTERNAL_PLUGIN_RESTART_REQUIRED:"));
-        assert_eq!(
-            std::fs::read_to_string(profile.join("cordis.yml")).unwrap(),
-            running_root
-        );
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            needs_repair.to_string()
-        );
-        assert_eq!(
-            std::fs::read_to_string(entry.join("package.json")).unwrap(),
-            "{}"
-        );
-        std::fs::write(&path, healthy.to_string()).unwrap();
-        let running = running_check().unwrap();
-        assert!(running.migration_pending);
-        assert!(require_running_plugins_ready(&profile, &running)
-            .unwrap_err()
-            .starts_with("INTERNAL_PLUGIN_RESTART_REQUIRED:"));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), healthy.to_string());
-        assert_eq!(check(&healthy).unwrap(), EarlyPluginState::Ready);
-        assert_eq!(
-            prepare_early_plugins_from(&profile, root.path(), &presets, None, |_| None).unwrap(),
-            EarlyPluginState::Defer
-        );
-        std::fs::remove_file(source.join("package.json")).unwrap();
-        assert_eq!(check(&healthy).unwrap(), EarlyPluginState::Defer);
-        std::fs::write(source.join("package.json"), "{}").unwrap();
-        let mut missing_bundle = healthy.clone();
-        missing_bundle["dsh"]["profile"]["bundles"] = serde_json::json!([]);
-        assert_eq!(check(&missing_bundle).unwrap(), EarlyPluginState::Defer);
-        assert_eq!(
-            std::fs::read_to_string(entry.join("package.json")).unwrap(),
-            "{}"
-        );
-        let mut wrong_dep = healthy.clone();
-        wrong_dep["dependencies"]["builtin"] = serde_json::json!("link:/missing/source");
-        assert_eq!(check(&wrong_dep).unwrap(), EarlyPluginState::Defer);
-        let mut missing_preset = healthy.clone();
-        missing_preset["dependencies"]["community"] = serde_json::json!("1.0.0");
-        assert_eq!(check(&missing_preset).unwrap(), EarlyPluginState::Defer);
-        let mut dangling = healthy.clone();
-        dangling["dependencies"]["removed"] = serde_json::json!("link:missing-source");
-        assert_eq!(check(&dangling).unwrap(), EarlyPluginState::Defer);
-        let old_plugin = profile.join("node_modules/old-plugin");
-        std::fs::create_dir_all(&old_plugin).unwrap();
-        std::fs::write(old_plugin.join("data.json"), "user data").unwrap();
-        let mut with_old_plugin = migrated.clone();
-        with_old_plugin["dependencies"]["old-plugin"] = serde_json::json!("1.0.0");
-        with_old_plugin["dsh"]["profile"]["bundles"] = serde_json::json!(["builtin", "old-plugin"]);
-        assert_eq!(check(&with_old_plugin).unwrap(), EarlyPluginState::Ready);
-        let preserved: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(preserved, with_old_plugin);
-        assert_eq!(
-            std::fs::read_to_string(old_plugin.join("data.json")).unwrap(),
-            "user data"
-        );
-        std::fs::remove_file(entry.join("package.json")).unwrap();
-        assert_eq!(check(&healthy).unwrap(), EarlyPluginState::Defer);
-        assert!(!entry.join("package.json").exists());
-        std::fs::write(&path, "{").unwrap();
-        assert!(
-            prepare_early_plugins_from(&profile, root.path(), &presets, None, |_| None)
-                .unwrap_err()
-                .starts_with("INTERNAL_PLUGIN_MANIFEST_PARSE_FAILED:")
-        );
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{");
-        assert_eq!(
-            prepare_early_plugins(&profile, root.path(), None, None, None).unwrap(),
-            EarlyPluginState::Defer
-        );
-    }
-
-    #[test]
     fn post_install_manifest_check_rejects_missing_or_unreadable_manifest() {
         let root = tempfile::tempdir().unwrap();
         let need = need_entries(&["dsh-tauri", "dsh-tauri-ui"]);
@@ -1757,16 +1925,16 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("package.json"), serde_json::json!({
             "dependencies": {"dsh-tauri": "link:/resources/dsh-tauri", "dsh-tauri-ui": "link:/resources/dsh-tauri-ui"},
-            "dsh": {"profile": {"bundles": ["dsh-tauri", "dsh-tauri-pet", "community-plugin"]}}
+            "dsh": {"profile": {"bundles": ["dsh-tauri", "dsh-tauri-archive", "community-plugin"]}}
         }).to_string()).unwrap();
         assert_eq!(
             presets_missing_from_manifest(
                 root.path(),
-                &need_entries(&["dsh-tauri", "dsh-tauri-ui", "dsh-tauri-pet"])
+                &need_entries(&["dsh-tauri", "dsh-tauri-ui", "dsh-tauri-archive"])
             ),
             Some(vec![
                 "dsh-tauri-ui".to_string(),
-                "dsh-tauri-pet".to_string()
+                "dsh-tauri-archive".to_string()
             ])
         );
         assert_eq!(
@@ -1798,8 +1966,8 @@ mod tests {
     fn link_materialization_failure_detects_uv_unknown_readback() {
         let error = "PREINSTALL_FAILED: dsh plugin exited with code -4094: UNKNOWN  UNKNOWN: \
                      unknown error, open 'C:\\Users\\w00012491\\.dsh\\profiles\\tauri\\node_modules\\\
-                     dsh-tauri-scheduler\\package.json'";
-        let need = need_entries(&["dsh-tauri-scheduler"]);
+                     dsh-tauri-ui\\package.json'";
+        let need = need_entries(&["dsh-tauri-ui"]);
         assert!(is_link_materialization_failure(error, &need));
         // pnpm / Node 的措辞随版本变化，判定大小写不敏感
         assert!(is_link_materialization_failure(
@@ -1821,8 +1989,7 @@ mod tests {
     /// `cannot resolve profile bundle` 点名了本轮待装入口，同样必须走离线自建链接兜底。
     #[test]
     fn link_materialization_failure_detects_unresolved_internal_bundle() {
-        let error =
-            "PREINSTALL_FAILED: dsh plugin exited with code 1: throw new Error(`${binName}: \
+        let error = "PREINSTALL_FAILED: dsh plugin exited with code 1: throw new Error(`${binName}: \
                      cannot resolve profile bundle ${JSON.stringify(packageName)} ...`);\n\
                      Error: dsh: cannot resolve profile bundle \"dsh-tauri\" from the dsh \
                      installation or C:\\Users\\A1\\.dsh\\profiles\\web; run 'dsh plugin --profile \
@@ -1893,6 +2060,35 @@ mod tests {
         assert!(unlinked_internal_entries(&need).is_empty());
     }
 
+    /// pnpm 11 的 lockfile 供应链校验会让内置插件每一轮都被打回（#1348）：两种可观测
+    /// 形态都必须命中，否则 dsh-taiwind 永不落盘、设置界面持续错位。
+    #[test]
+    fn supply_chain_policy_failure_covers_parsed_and_raw_forms() {
+        assert!(is_supply_chain_policy_failure(
+            "PLUGIN_POLICY_BLOCKED: [{\"name\":\"dsh-taiwind\",\"version\":\"0.1.2\"}]"
+        ));
+        assert!(is_supply_chain_policy_failure(
+            "PREINSTALL_FAILED: dsh plugin exited with code 1: \u{2717} Lockfile failed supply-chain policy check (334 entries in 2.1s) Error: ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION"
+        ));
+        assert!(is_supply_chain_policy_failure(
+            "INTERNAL_PLUGIN_INSTALL_FAILED: PREINSTALL_FAILED: dsh plugin exited with code 1: Error: ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION"
+        ));
+    }
+
+    /// 其它失败一律不能命中：兜底会把用户自己的真实失败吞成「安装成功」。
+    #[test]
+    fn supply_chain_policy_failure_rejects_unrelated_failures() {
+        for error in [
+            "PREINSTALL_FAILED: dsh plugin exited with code 1: ERR_PNPM_SPEC_NOT_SUPPORTED",
+            "NETWORK_ERROR: plugin registry request failed; check network or proxy settings and retry.",
+            "PREINSTALL_FAILED: dsh plugin exited with code -4094: UNKNOWN: unknown error, open 'C:\\x\\node_modules\\dsh-tauri\\package.json'",
+            "PLUGIN_VERSION_INCOMPATIBLE: []",
+            "PREINSTALL_FAILED: dsh plugin exited with code 1: ✗ Lockfile failed supply-chain policy check (201 entries) Error: ERR_PNPM_TRUST_DOWNGRADE lodash@4.17.21 is a downgrade",
+        ] {
+            assert!(!is_supply_chain_policy_failure(error), "{error}");
+        }
+    }
+
     /// 同一签名也可能来自用户自己的 `link:` 依赖（`pnpm add` 会一并解析项目依赖）：
     /// 失败路径不属于本轮内置插件时绝不能兜底，否则真实失败被吞成「安装成功」。
     #[test]
@@ -1902,7 +2098,7 @@ mod tests {
                      someone-else-plugin\\package.json'";
         assert!(!is_link_materialization_failure(
             error,
-            &need_entries(&["dsh-tauri-scheduler"])
+            &need_entries(&["dsh-tauri-ui"])
         ));
     }
 
@@ -1912,7 +2108,7 @@ mod tests {
     fn link_materialization_failure_rejects_unattributed_diagnostic() {
         let error = "PREINSTALL_FAILED: dsh plugin exited with code -4094: UNKNOWN: cannot \
                      materialize node_modules entry";
-        let need = need_entries(&["dsh-tauri-scheduler"]);
+        let need = need_entries(&["dsh-tauri-ui"]);
 
         assert!(!is_link_materialization_failure(error, &need));
         assert!(is_untraceable_link_readback_failure(error));

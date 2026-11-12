@@ -1,13 +1,12 @@
+use crate::AppHandle;
 use crate::config;
 use async_trait::async_trait;
 use std::path::PathBuf;
-use crate::AppHandle;
 
 /// 安装任务的类型标识：下载源选择、完整性校验与版本记录都按它分支，
 /// 而不是按任务在 `tasks` 向量里的位置索引（重排向量不应改变行为）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallKind {
-    Node,
     Dsh,
     Pnpm,
     /// 仅 Windows 构造：`Git` 安装任务按 `#[cfg(windows)]` 加入任务列表。
@@ -19,7 +18,6 @@ impl InstallKind {
     /// 对应的依赖映射键（见 `config::dependencies`）
     pub fn dependency_key(self) -> &'static str {
         match self {
-            InstallKind::Node => config::dependencies::DEP_NODE,
             InstallKind::Dsh => config::dependencies::DEP_DSH,
             InstallKind::Pnpm => config::dependencies::DEP_PNPM,
             InstallKind::Git => config::dependencies::DEP_GIT,
@@ -32,7 +30,14 @@ pub trait Installable: Send + Sync {
     fn kind(&self) -> InstallKind;
     fn title(&self) -> &str;
     fn check_installed(&self, app: &AppHandle) -> bool;
-    fn get_download_url(&self) -> Result<String, String>;
+    /// 固定下载地址。Harness 核心不实现：它的资产名随核心格式变化，
+    /// 由安装流程按当前设置解析（见 `config::get_dsh_download_url`）。
+    fn get_download_url(&self) -> Result<String, String> {
+        Err(format!(
+            "INSTALL_TASK_INVALID: {} has no fixed download URL",
+            self.title()
+        ))
+    }
     fn get_install_path(&self, app: &AppHandle) -> PathBuf;
     /// 把该依赖当前解析出的安装根写回映射表（系统环境满足 → `null`）。
     ///
@@ -44,8 +49,7 @@ pub trait Installable: Send + Sync {
 /// 依赖任务清单（唯一构造点：安装流程与映射回写共用同一组任务）。
 pub fn tasks() -> Vec<Box<dyn Installable>> {
     #[cfg_attr(not(windows), allow(unused_mut))]
-    let mut tasks: Vec<Box<dyn Installable>> =
-        vec![Box::new(Nodejs), Box::new(Dsh), Box::new(Pnpm)];
+    let mut tasks: Vec<Box<dyn Installable>> = vec![Box::new(Dsh), Box::new(Pnpm)];
     #[cfg(windows)]
     tasks.push(Box::new(Git));
     tasks
@@ -58,55 +62,18 @@ pub fn record_mappings(app: &AppHandle) {
     }
 }
 
-// --- Node.js 实现 ---
-pub struct Nodejs;
-
-#[async_trait]
-impl Installable for Nodejs {
-    fn kind(&self) -> InstallKind {
-        InstallKind::Node
-    }
-    fn title(&self) -> &str {
-        "运行环境"
-    }
-    fn get_download_url(&self) -> Result<String, String> {
-        config::get_node_download_url()
-    }
-    fn get_install_path(&self, app: &AppHandle) -> PathBuf {
-        config::get_node_install_path(app)
-    }
-    fn check_installed(&self, app: &AppHandle) -> bool {
-        // 原生模块 ABI 探测已判定本地 node 无法加载核心的原生模块（issue #441）：
-        // 此时不能再以"本机有版本兼容的 node"为由跳过捆绑运行时，否则服务进程仍会
-        // 用那个 ABI 不匹配的运行时启动。
-        if config::prefer_bundled_node_runtime() {
-            return config::bundled_node_binary(app).is_some()
-                && config::is_runtime_compatible(app);
-        }
-        if let Some(local_node) = config::get_local_node_path() {
-            log::info!(
-                "Detected compatible local Node.js ({}), skipping bundled runtime",
-                local_node.display()
-            );
-            return true;
-        }
-        config::get_node_binary_path(app).exists() && config::is_runtime_compatible(app)
-    }
-    fn record_mapping(&self, app: &AppHandle) {
-        let managed = config::get_node_install_path(app);
-        // ABI 探测要求捆绑运行时时不能把系统 node 记为可用（与实际拉起的进程一致）。
-        let system =
-            !config::prefer_bundled_node_runtime() && config::get_local_node_path().is_some();
-        config::dependencies::record(
-            app,
-            InstallKind::Node.dependency_key(),
-            (!system).then_some(managed),
-        );
-    }
-}
-
 // --- DeepSeek Harness 实现 ---
 pub struct Dsh;
+
+impl Dsh {
+    /// 托管核心的磁盘形态是否已与 `core_asar` 设置不符：切换核心格式后必须重新下载。
+    /// 随包内核随安装包分发、无法重下，不参与判定。
+    pub fn format_mismatch(&self, app: &AppHandle) -> bool {
+        config::dependencies::bundled_core_dir(app).is_none()
+            && config::core_archive_in(&config::get_dsh_install_path(app)).is_some()
+                != config::get_store_dat_setting(app).core_asar
+    }
+}
 
 #[async_trait]
 impl Installable for Dsh {
@@ -116,20 +83,29 @@ impl Installable for Dsh {
     fn title(&self) -> &str {
         "Harness 核心"
     }
-    fn get_download_url(&self) -> Result<String, String> {
-        config::get_dsh_download_url()
-    }
     fn get_install_path(&self, app: &AppHandle) -> PathBuf {
-        config::get_dsh_install_path(app)
+        let root = config::get_dsh_install_path(app);
+        let base = config::get_base_dir(app).join("dependencies");
+        if root.starts_with(&base) && config::core_archive_in(&root).is_some() {
+            root
+        } else {
+            base.join("dsh")
+        }
     }
     fn check_installed(&self, app: &AppHandle) -> bool {
-        crate::service::core::active_dsh_binary(app).is_file()
+        // 文件在盘还不够：应用自动更新会把清单的最低支持核心版本顶高，而托管目录里
+        // 还是升级前的旧文件。此时判为「未安装」才能让安装流程按记录 tag 重新下载，
+        // 否则启动永远停在校验失败，重试也走同一条链路（issue #1374）。
+        // 核心入口可能在 asar 归档内部（std::fs 看不到），必须走归档感知的判定。
+        config::core_entry_exists(&crate::service::core::active_dsh_binary(app))
+            && crate::service::core::app_core_meets_baseline(app)
+            && !self.format_mismatch(app)
     }
     fn record_mapping(&self, app: &AppHandle) {
         // 记录**当前生效的根**而不是清单托管根：随包资源构建（离线包）里用户可以把内核
         // 切到 AppData 的槽位，写回托管根会把这次切换悄悄改回随包内核。
         let active = config::dependencies::active_root(app, config::dependencies::DEP_DSH);
-        if config::get_dsh_binary_path(app).is_file() {
+        if config::core_entry_exists(&config::get_dsh_binary_path(app)) {
             config::dependencies::record(app, InstallKind::Dsh.dependency_key(), Some(active));
         } else if crate::service::core::active_version(app).is_some() {
             // 只有系统（本地）核心可用：该依赖由系统环境满足。

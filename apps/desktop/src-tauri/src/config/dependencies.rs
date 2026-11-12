@@ -12,12 +12,12 @@
 //! 各有一处真值。将来做本地捆绑版只需把清单（或映射表）指向 `resources/*`，路径解析
 //! 逻辑无需改动。写入单点收口到 [`record`]，且内容不变时不落盘。
 
-use crate::{AppHandle};
+use crate::AppHandle;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use tauri::{ Runtime};
+use tauri::Runtime;
 
 use super::manifest;
 
@@ -25,7 +25,6 @@ use super::manifest;
 pub const MAPPING_FILE: &str = "dependencies.json";
 
 /// 逻辑依赖键
-pub const DEP_NODE: &str = "node";
 pub const DEP_PNPM: &str = "pnpm";
 pub const DEP_DSH: &str = "dsh";
 pub const DEP_GIT: &str = "git";
@@ -161,11 +160,6 @@ pub fn record<R: Runtime>(app: &AppHandle<R>, key: &str, value: Option<PathBuf>)
     }
 }
 
-/// 单键映射（见 [`DependencyMapping::get`]）
-pub fn mapped<R: Runtime>(app: &AppHandle<R>, key: &str) -> Option<Option<PathBuf>> {
-    read_mapping(app).get(key)
-}
-
 /// 清单声明的默认托管根（映射未记录或为系统时使用）
 pub fn managed_root<R: Runtime>(app: &AppHandle<R>, key: &str) -> PathBuf {
     let base = super::runtime::get_base_dir(app);
@@ -225,13 +219,11 @@ pub(crate) fn active_root_from(
     let overridable = manifest
         .and_then(|manifest| manifest.dependencies.get(key))
         .is_none_or(|spec| spec.overridable);
-    if overridable {
-        if let Some(Some(recorded)) = mapping.get(key) {
-            let resolved =
-                manifest::resolve_location_from(base, resources, &recorded.to_string_lossy());
-            if resolved.exists() {
-                return resolved;
-            }
+    if overridable && let Some(Some(recorded)) = mapping.get(key) {
+        let resolved =
+            manifest::resolve_location_from(base, resources, &recorded.to_string_lossy());
+        if resolved.exists() {
+            return resolved;
         }
     }
     managed_root_from(base, resources, manifest, key)
@@ -265,9 +257,24 @@ pub(crate) fn entry_relative_from(manifest: Option<&manifest::Manifest>, key: &s
     split_entry(declared.unwrap_or_else(|| default_entry(key)))
 }
 
-/// 当前生效的依赖入口绝对路径（不校验存在性）
 pub fn binary_path<R: Runtime>(app: &AppHandle<R>, key: &str) -> PathBuf {
-    active_root(app, key).join(entry_relative(app, key))
+    binary_path_at(app, &active_root(app, key), key)
+}
+
+/// 指定依赖根下的入口：dsh 的入口形状由**磁盘**决定——托管根里有核心归档就进归档，
+/// 否则按普通目录核心解析。设置（core_asar）只决定下载哪种资产，切换中途或设置与磁盘
+/// 不一致时仍应启动得了盘上那份。
+pub fn binary_path_at<R: Runtime>(app: &AppHandle<R>, root: &Path, key: &str) -> PathBuf {
+    binary_path_in(root, &entry_relative(app, key), key)
+}
+
+fn binary_path_in(root: &Path, entry: &Path, key: &str) -> PathBuf {
+    if key == DEP_DSH
+        && let Some(archive) = super::runtime::core_archive_in(root)
+    {
+        return archive.join(entry);
+    }
+    root.join(entry)
 }
 
 /// 入口路径 → 相对路径（统一分隔符；`/` 与 `\` 都接受）
@@ -279,7 +286,6 @@ fn split_entry(raw: &str) -> PathBuf {
 
 fn default_managed_root(key: &str) -> &'static str {
     match key {
-        DEP_NODE => "runtime",
         DEP_PNPM => "dependencies/pnpm",
         DEP_DSH => "dependencies/dsh",
         DEP_GIT => "dependencies/git",
@@ -289,13 +295,6 @@ fn default_managed_root(key: &str) -> &'static str {
 
 fn default_entry(key: &str) -> &'static str {
     match key {
-        DEP_NODE => {
-            if cfg!(windows) {
-                "node.exe"
-            } else {
-                "bin/node"
-            }
-        }
         DEP_PNPM => "bin/pnpm.cjs",
         DEP_DSH => "node_modules/@deepseek-ai/dsh/lib/bin.js",
         DEP_GIT => {
@@ -331,18 +330,17 @@ mod tests {
         let file = dir.join(MAPPING_FILE);
 
         let mut mapping = DependencyMapping::default();
-        mapping.set(DEP_NODE, Some(PathBuf::from("C:/app/runtime")));
+        mapping.set(DEP_DSH, Some(PathBuf::from("C:/app/dependencies/dsh")));
         mapping.set(DEP_PNPM, None);
         std::fs::write(&file, serde_json::to_string_pretty(&mapping).unwrap()).unwrap();
 
         let read = read_mapping_at(&file);
         assert_eq!(
-            read.get(DEP_NODE),
-            Some(Some(PathBuf::from("C:/app/runtime")))
+            read.get(DEP_DSH),
+            Some(Some(PathBuf::from("C:/app/dependencies/dsh")))
         );
         assert_eq!(read.get(DEP_PNPM), Some(None));
-        assert_eq!(read.get(DEP_DSH), None);
-        assert!(read.get(DEP_NODE).is_some_and(|value| value.is_some()));
+        assert!(read.get(DEP_DSH).is_some_and(|value| value.is_some()));
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -410,6 +408,20 @@ mod tests {
     }
 
     #[test]
+    fn dsh_entry_follows_the_artifact_on_disk() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("dsh");
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = Path::new("node_modules/@deepseek-ai/dsh/lib/bin.js");
+        assert_eq!(binary_path_in(&dir, entry, DEP_DSH), dir.join(entry));
+
+        let archive = dir.join(super::super::runtime::dsh_core_asar_filename().unwrap());
+        std::fs::write(&archive, b"asar").unwrap();
+        assert_eq!(binary_path_in(&dir, entry, DEP_DSH), archive.join(entry));
+        assert_eq!(binary_path_in(&dir, entry, DEP_PNPM), dir.join(entry));
+    }
+
+    #[test]
     fn entry_split_accepts_both_separators() {
         assert_eq!(
             split_entry("bin/pnpm.cjs"),
@@ -428,7 +440,7 @@ mod tests {
 
     #[test]
     fn default_roots_and_entries_match_the_manifest_spec() {
-        assert_eq!(default_managed_root(DEP_NODE), "runtime");
+        assert_eq!(default_managed_root("node"), "dependencies");
         assert_eq!(default_managed_root(DEP_PNPM), "dependencies/pnpm");
         assert_eq!(default_managed_root(DEP_DSH), "dependencies/dsh");
         assert_eq!(default_entry(DEP_PNPM), "bin/pnpm.cjs");
@@ -445,5 +457,4 @@ mod tests {
             }
         );
     }
-
 }

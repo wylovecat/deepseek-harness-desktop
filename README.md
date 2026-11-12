@@ -51,7 +51,7 @@
 - 🗂️ **档案配置** — 分别管理插件与设置，支持一键迁移档案数据、备份、克隆；
 - 💽 **数据目录** — 安装时（Windows）可选择数据存放位置；能在设置里整体迁移与回滚。
 - ⌨️ **命令行集成** — 通过托管 shim 提供 `dsh` / `pnpm` 命令行工具，不是全局 npm 内核安装。
-- 🐾 **桌宠** — Pets / Codex 资源管理、资源包导入与会话状态展示；预设素材来自远端。
+- 🐾 **桌宠** — 由 `dsh-pet-lite` 预设插件提供，见下方「预设插件」。
 - 🎨 **个性化** — 8 种配色、本机界面缩放、终端模式，以及可调不透明度与可选磨砂模糊。
 
 ## 内置插件
@@ -60,12 +60,10 @@
 
 - [DSH Tauri](https://dshtauri.mintlify.site/zh-CN/built-in-plugins/dsh-tauri) — 核心插件，桌面端与 Harness 通信、版本适配器、插件依赖管理
 - [DSH Tauri UI](https://dshtauri.mintlify.site/zh-CN/built-in-plugins/dsh-tauri-ui) — 桌面设置界面、原生核心组件、主题与配色
-- [DSH Tauri Mobile UI](https://dshtauri.mintlify.site/zh-CN/built-in-plugins/dsh-tauri-mobile-ui) — 触屏布局与移动端偏好设置
 - [DSH Tauri Worktree](https://dshtauri.mintlify.site/zh-CN/built-in-plugins/dsh-tauri-worktree) — 会话级 Git 工作树与检出
 - [DSH Tauri Extension](https://dshtauri.mintlify.site/zh-CN/built-in-plugins/dsh-tauri-extension) — 官方插件管理、插件市场、Skills 与 MCP
-- [DSH Tauri Scheduler](https://dshtauri.mintlify.site/zh-CN/built-in-plugins/dsh-tauri-scheduler) — 定时任务与执行记录
 - [DSH Tauri Archive](https://dshtauri.mintlify.site/zh-CN/built-in-plugins/dsh-tauri-archive) — 聊天归档与恢复
-- [DSH Tauri Pet](https://dshtauri.mintlify.site/zh-CN/built-in-plugins/dsh-tauri-pet) — 桌宠与活动状态设置
+- [DSH Pet Lite](https://github.com/hairyf/dsh-pet-lite) — 轻量桌宠预设插件，需在插件页自行安装
 - [DSH Tauri Rightclick Menu](https://dshtauri.mintlify.site/zh-CN/built-in-plugins/dsh-tauri-rightclick) — 会话、工作区与正文右键菜单
 - [DSH Tauri Model](https://dshtauri.mintlify.site/zh-CN/built-in-plugins/dsh-tauri-model) — 模型选择与参数、自动配置模型
 - [DSH Tauri Remote](https://dshtauri.mintlify.site/zh-CN/built-in-plugins/dsh-tauri-remote) — SSH 远端 Harness 连接与同步，并把本机 Harness 分享到局域网或公网隧道
@@ -76,12 +74,12 @@
 启动引导提供以下社区插件，可按需安装；
 
 - [DSH Better Sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) — 按会话隔离的右编辑器侧栏
-- [Billion Context](https://github.com/ranxianglei/billion-context) — 上下文压缩与历史恢复
 - [DSH Office Kit](https://github.com/hairyf/dsh-office-kit) — Office 文档、PDF、演示文稿与表格
 - [DSH Market](https://github.com/dsh-market/dsh-market) — 社区插件市场
 - [DSH Rewind](https://github.com/SiriLee/dsh-rewind) — 对话回退与工作区备份
 - [DSH IM](https://github.com/xmanrui/dsh-im) — IM 渠道与机器人管理
 - [DSH OPS](https://github.com/T-Auto/dsh-ops) — 底层操作工具，减少 Token 消耗与任务耗时
+- [Billion Context](https://github.com/ranxianglei/billion-context) — 上下文压缩与历史恢复
 
 新增或更新预设请提交 [Issue](https://github.com/dsh-tauri/deepseek-harness-desktop/issues)；可用版本由清单中的内核兼容规则决定。
 
@@ -183,7 +181,7 @@ Windows 启动失败时会通过原生对话框显示具体错误。若出现 `S
 - [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) — 上游 `dsh` agent 平台
 - [deepseek-harness-pkg](https://github.com/dsh-tauri/deepseek-harness-pkg) — 预打包 Harness 发行版与下载源
 - [electron-rs](https://github.com/hairyf/electron-rs) · [tauri-runtime-electron](https://github.com/hairyf/tauri-runtime-electron) — Electron Rust 与 Tauri 2 的 Electron 运行时
-- [dsh-pet](https://github.com/PC2005-cloud/dsh-pet) · [dsh-pet-mov](https://github.com/dsh-tauri/dsh-pet-mov) · [dsh-pet-component](https://github.com/dsh-tauri/dsh-pet-component) — 桌宠素材与渲染组件
+- [dsh-pet-lite](https://github.com/hairyf/dsh-pet-lite) · [dsh-pet](https://github.com/PC2005-cloud/dsh-pet) · [dsh-pet-component](https://github.com/dsh-tauri/dsh-pet-component) — 桌宠插件、素材与渲染组件
 - [dsh-plugin-codex-pets](https://github.com/Skylarking/dsh-plugin-codex-pets) · [BongoCat](https://github.com/ayangweb/BongoCat) · [dsh-dafeiyu](https://github.com/QCYTSN/dsh-dafeiyu) · [codex-to-dsh-pet](https://github.com/Signalight/codex-to-dsh-pet) · [dsh-pet-sticker](https://github.com/PC2005-cloud/dsh-pet-sticker) — 桌宠参考项目
 
 ## Contributors

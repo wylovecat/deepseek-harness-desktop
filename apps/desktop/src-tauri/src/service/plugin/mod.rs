@@ -25,8 +25,7 @@
 //! - [`errors`]：插件错误记录（安装/升级/卸载失败 + 页面运行期上报，持久化）
 //! - [`process`]：dsh 子进程启动与输出流逐行转发
 //! - [`recovery`]：插件异常定位与一键离线卸载
-//! - [`safe`]：安全档案启动前的用户插件清除（只留内置插件与核心包）
-//! - [`patch_guard`]：补丁层 YAML 语法错误的显式隔离（安全模式 / 错误页恢复入口）
+//! - [`patch_guard`]：补丁层 YAML 语法错误的显式隔离（错误页恢复入口）
 //! - [`patch_entries`]：补丁层悬空 `insert` 条目的启动前预检与显式清理（错误页恢复入口）
 //! - [`cancel`]：Windows 下取消正在进行的安装
 //! - [`watch`]：已安装插件文件监控（轮询指纹比对 + `dsh-plugins-updated` 事件推送）
@@ -48,7 +47,7 @@ mod patch_yaml;
 mod preset;
 mod process;
 pub mod recovery;
-mod safe;
+mod retire;
 pub mod snapshot;
 pub mod update;
 pub mod verify;
@@ -58,48 +57,40 @@ pub(crate) use crate::service::profile::ensure_profile_pnpm_policy;
 pub use cancel::cancel;
 pub(crate) use cancel::terminate_active_installs_blocking;
 pub use disable::{disable, enable};
-pub(crate) use hmr::sync_layer_at as local_plugin_hmr_sync_at;
 pub use hmr::LocalHmrStatus;
+pub(crate) use hmr::sync_layer_at as local_plugin_hmr_sync_at;
 pub(crate) use hmr::{status as local_plugin_hmr_status, sync_layer as local_plugin_hmr_sync};
 pub(crate) use install::harness_prefer_bundled_pnpm_from;
 pub(crate) use install::local_spec_from_path;
 pub(crate) use install::packument;
 pub use install::{
-    allow_policy_versions, allow_version_exemptions, inspect_specs, install, install_specs,
-    remove_many, update_many, IncompatibleVersion, PolicyBlockedVersion,
+    IncompatibleVersion, PolicyBlockedVersion, allow_policy_versions, allow_version_exemptions,
+    inspect_specs, install, install_specs, remove_many, update_many,
 };
-#[cfg(any(windows, test))]
-pub(crate) use installed::ensure_npmrc_at;
-pub(crate) use installed::{
-    declared_packages, ensure_profile_npmrc, installed_name, list_installed, profile_dir,
-    ProfilePackageJson,
-};
-pub use installed::{list, PreinstallPlugin};
+pub use installed::{PreinstallPlugin, list};
+pub(crate) use installed::{ProfilePackageJson, ensure_profile_npmrc, profile_dir};
 pub(crate) use internal::cancel as cancel_internal_plugins;
 pub(crate) use internal::ensure as ensure_internal_plugins;
-pub(crate) use internal::{internal_plugin_entry_is_ready, skip_unavailable_plugins};
-#[cfg(any(windows, test))]
-pub(crate) use internal::{prepare_early_plugins, EarlyPluginState};
-pub(crate) use patch_entries::{strip_active_unresolved_entries, PatchEntryStripReport};
+pub(crate) use patch_entries::{PatchEntryStripReport, strip_active_unresolved_entries};
 pub(crate) use patch_guard::preflight_at as preflight_patch_entries_at;
 pub(crate) use patch_guard::{
-    patch_layer_paths, quarantine_active_patch_layers, quarantine_failure_message,
-    quarantine_patch_layers_in, PatchQuarantineReport,
+    PatchQuarantineReport, patch_layer_paths, quarantine_active_patch_layers,
+    quarantine_failure_message,
 };
 pub(crate) use patch_yaml::{parse_patch_layer, render_patch_layer};
 pub use preset::repo_url_of;
-#[cfg(any(windows, test))]
-pub(crate) use preset::{bundled_plugin_dir_from, presets_from_manifest};
 pub(crate) use preset::{
-    bundled_plugin_dir, current_preset_hash, load_presets, preinstall_pending,
-    remove_legacy_bundled_plugins,
+    current_preset_hash, load_presets, preinstall_pending, remove_legacy_bundled_plugins,
 };
 pub(crate) use process::{
-    acquire_operation_lock, is_internal_plugin_startup_failure, is_process_cleanup_failure,
+    acquire_operation_lock, acquire_process_lock, is_internal_plugin_startup_failure,
+    is_process_cleanup_failure,
 };
+#[cfg(test)]
+pub(crate) use process::TEST_PROCESS_LOCK;
 pub use recovery::{
-    detect as detect_recovery, uninstall as uninstall_recovery, PluginRecoveryInfo,
+    PluginRecoveryInfo, detect as detect_recovery, uninstall as uninstall_recovery,
 };
-pub(crate) use safe::purge_user_plugins_in_safe_profile;
+pub(crate) use retire::uninstall as retire_deprecated_plugins;
 pub(crate) use verify::ensure_preset_plugins;
 pub use watch::DshPlugin;
