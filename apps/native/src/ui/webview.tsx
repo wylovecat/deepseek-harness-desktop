@@ -10,7 +10,7 @@ import { useThemeColor } from 'heroui-native/hooks'
 import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { If, Then } from 'react-if-lite'
-import { BackHandler, Dimensions, Keyboard, Linking, Modal, Platform, Pressable, Text, View } from 'react-native'
+import { BackHandler, Clipboard, Dimensions, Keyboard, Linking, Modal, Platform, Pressable, Text, View } from 'react-native'
 import { ArrowLeft, Hand } from 'react-native-lucide'
 import { SafeAreaView } from 'react-native-safe-area-context'
 import { WebView } from 'react-native-webview'
@@ -24,6 +24,7 @@ import { requestNotificationAccess, sendNativeNotification } from '@/hooks/use-n
 import { connection } from '@/store/modules/connection'
 import { connectAddress, refreshHealth } from '@/store/modules/connection/runtime'
 import { buildConnectUrl, isTrustedOrigin } from '@/utils/bridge-protocol'
+import { buildDiagnosticLog } from '@/utils/diagnostics'
 import { createNotificationShim, keyboardHeightScript, nativeMessageScript, parseNativeMessage } from '@/utils/webview-bridge'
 
 export function BridgeWebView({ address, generation }: { address: BridgeAddress, generation: number }) {
@@ -252,6 +253,26 @@ export function BridgeWebView({ address, generation }: { address: BridgeAddress,
     connection.setDrawerOpen(true)
     void refreshHealth()
   }
+  function copyLogs() {
+    const log = buildDiagnosticLog({
+      address,
+      stage: connection.stage,
+      health: connection.health[address.id],
+      loadError: state.loadError,
+      notice: state.notice,
+      probe: state.diagnostic,
+      authenticated: connection.tokens[address.id] !== undefined,
+      timedOut: loadingTimedOut,
+    })
+    try {
+      Clipboard.setString(log)
+      connection.setNotice(t('connection.copyLogDone'))
+    }
+    catch (error) {
+      console.error('[webview] copy diagnostics failed:', error)
+      connection.setNotice(t('connection.copyLogFailed'))
+    }
+  }
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: background }} edges={edges}>
       <View className="flex-1">
@@ -291,10 +312,10 @@ export function BridgeWebView({ address, generation }: { address: BridgeAddress,
           onRenderProcessGone={() => connection.markLoadFailed(generation, t('connection.connectionFailed'))}
           onContentProcessDidTerminate={() => connection.markLoadFailed(generation, t('connection.connectionFailed'))}
         />
-        <If cond={state.notice && !state.drawerOpen}>
+        <If cond={state.notice && !state.drawerOpen && Boolean(state.loadError || (loadingTimedOut && !documentReady))}>
           <Then>
             <Pressable
-              className="absolute left-3 right-3 top-3 rounded-xl border border-border bg-surface px-4 py-3"
+              className="absolute bottom-6 left-6 right-6 rounded-xl border border-border bg-surface px-4 py-3"
               accessibilityRole="button"
               accessibilityLabel={state.notice ?? t('connection.connectionInfo')}
               onPress={openDrawer}
@@ -320,6 +341,7 @@ export function BridgeWebView({ address, generation }: { address: BridgeAddress,
             <View className="absolute inset-0 items-center justify-center gap-5 bg-background px-8">
               <Text className="text-center text-base leading-7 text-foreground" accessibilityLiveRegion="polite">{state.loadError ?? t('connection.loadingSlow')}</Text>
               <Button onPress={() => connectAddress(address)}>{t('connection.reconnect')}</Button>
+              <Button variant="ghost" onPress={copyLogs}>{t('connection.copyLog')}</Button>
               <Button variant="ghost" onPress={openDrawer}>{t('connection.connectionInfo')}</Button>
             </View>
           </Then>

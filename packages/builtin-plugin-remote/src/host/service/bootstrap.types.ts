@@ -6,6 +6,9 @@ export interface BootstrapLogLine {
   line: string
 }
 
+/** 发行包可用性：`available` 可下载；`missing` 已确认不存在（404）；`unknown` 网络不可达无法判定。 */
+export type ReleaseAvailability = 'available' | 'missing' | 'unknown'
+
 export interface DshNpmPlan {
   kind: 'npm-tgz'
   urls: string[]
@@ -43,4 +46,10 @@ export interface EnvCredentials {
 export interface BootstrapHooks {
   onProgress?: (progress: RemoteProgress) => void
   onEvent?: (stage: RemoteMachineStage, line: string, options?: { terminal?: RemoteMachineTerminal, reason?: string }) => void
+}
+
+export interface BootstrapInstallOptions {
+  /** 无视远端既有的安装标记，强制重跑安装脚本的全部组件安装段。 */
+  force?: boolean
+  failureLine?: string
 }

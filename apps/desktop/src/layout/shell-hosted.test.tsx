@@ -34,6 +34,7 @@ vi.mock('@/hooks/use-notification-action', () => ({ useNotificationAction: vi.fn
 vi.mock('@/hooks/use-notification-clicked', () => ({ useNotificationClicked: vi.fn() }))
 vi.mock('@overlastic/react', () => ({ useOverlay: () => vi.fn() }))
 vi.mock('@/ui/dialog/config', () => ({ ConfigDialog: () => null }))
+vi.mock('@/ui/core/core-download-widget', () => ({ CoreDownloadWidget: () => null }))
 vi.mock('@/ui/plugin/recovery', () => ({ Recovery: () => null }))
 vi.mock('./startup/preinstall', () => ({ PreinstallSetup: () => null }))
 vi.mock('./navbar/full-sidebar-navbar', () => ({ FullSidebarNavbar: () => null }))
@@ -53,6 +54,7 @@ beforeEach(() => {
     restartPending: false,
     webviewSrc: 'http://127.0.0.1:3081?t=1&dshDesktop=1',
     webviewKey: 0,
+    processGeneration: 0,
     webviewLoaded: false,
     webviewAliveKey: null,
     webviewError: false,
@@ -139,6 +141,15 @@ it('keeps an actual hosted service document transparent without rehosting its cu
   expect(harness.webviewLoaded).toBe(true)
   expect(harness.webviewAlive).toBe(true)
   expect(view.container.querySelector('main')?.className).toContain('pointer-events-none')
+})
+
+it('rehosts a same-origin document after the kernel process was replaced', async () => {
+  vi.stubGlobal('__DSH_BOOT__', { entries: [] })
+  vi.stubGlobal('location', new URL('http://127.0.0.1:3081/'))
+  harness.processGeneration = 1
+  render(<Shell />)
+  await act(async () => {})
+  expect(invoke).toHaveBeenCalledExactlyOnceWith('host_harness_document', { url: 'http://127.0.0.1:3081?t=1&dshDesktop=1' })
 })
 
 it('reloads an actual same-origin document only for a pending native restart', async () => {

@@ -1,20 +1,16 @@
 use crate::{AppHandle, Window};
-#[cfg(any(windows, target_os = "linux"))]
 use std::path::Path;
 #[cfg(windows)]
 use std::path::PathBuf;
 
-use tauri::{ Manager, Runtime};
+use tauri::{Manager, Runtime};
 
 pub fn show_window<R: Runtime>(window: &Window<R>) {
-    let _ = window.unminimize();
-    let _ = window.show();
-    let _ = window.set_focus();
+    crate::desktop::activation::bring_to_front(window);
 }
 
-/// 显示主窗口：托盘「打开面板」、托盘左键点击、macOS Dock 图标点击共用。
-/// 主窗口关闭只隐藏到托盘（见 builder 的 on_window_event），所以这里取到即可 show；
-/// 若窗口确实不存在（非预期路径），仅记录日志，不重建。
+/// 主窗口只在关窗时隐藏到托盘（见 builder 的 on_window_event），故取到即可显示；
+/// 窗口确实不存在时只记日志，不重建。
 pub fn shell_window<R: Runtime>(app: &AppHandle<R>) -> Option<Window<R>> {
     app.get_window("main").or_else(|| {
         app.windows().into_values().find(|window| {
@@ -38,26 +34,17 @@ pub fn operation_window<R: Runtime>(app: &AppHandle<R>) -> Option<Window<R>> {
 
 pub fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
     if let Some(window) = shell_window(app) {
-        // 关窗驻留用的是应用级 hide（NSApp hide:，见 builder 的 CloseRequested），
-        // 恢复前必须先 unhide 整个应用，否则 window.show() 在隐藏态应用上不可见。
+        // 关窗驻留是应用级 hide（NSApp hide:），不先 unhide 则 window.show() 不可见。
         #[cfg(target_os = "macos")]
         if let Err(error) = app.show() {
             log::warn!("[window] APP_SHOW_FAILED: {error}");
         }
-        // Accessory 下 window.show() 有历史问题（tauri #5122），必须先切回
-        // regular 再 show；放在这里可一次覆盖托盘菜单「打开面板」、托盘左键、
-        // RunEvent::Reopen、release single-instance 四条恢复路径。
+        // Accessory 下 window.show() 有历史问题（tauri #5122），必须先切回 regular。
         #[cfg(target_os = "macos")]
         crate::desktop::activation::set_regular_policy(app);
-        // 恢复路径不改变全屏状态：全屏关窗后从托盘恢复，窗口依旧全屏。
-        // 不在此重新挂起 Accessory：窗口此时已可见，若挂起推迟标志，用户
-        // 退出全屏时 on_window_resized 会把可见应用切进 Accessory，导致 Dock
-        // 图标与 ⌘-Tab 在窗口仍打开时消失。Accessory 只在关窗驻留路径的
-        // hide 之后生效，前台可见态应保持 regular。
         show_window(&window);
-        // 恢复路径不改变全屏状态：全屏关窗后从托盘恢复，窗口依旧全屏，
-        // 而 set_regular_policy 已无条件清掉推迟标志。这里按需重新挂起，
-        // 否则用户退出全屏时 Accessory 永不生效（Dock / ⌘-Tab 整个驻留期可见）。
+        // set_regular_policy 无条件清掉了推迟标志，全屏恢复后需按需挂回，
+        // 否则用户退出全屏时 Accessory 永不生效。
         #[cfg(target_os = "macos")]
         crate::desktop::activation::rearm_pending_accessory_if_fullscreen(&window);
     } else {
@@ -250,13 +237,155 @@ pub(crate) fn child_library_path(
     )
 }
 
+/// issue #1531：AppImage 运行时把 `PYTHONHOME` / `PYTHONPATH` 指向挂载点，让镜像自带
+/// 的 Python 生效。核心进程继承后再拉起外部应用（Kitty），对方的 Python 在
+/// `Failed to import encodings` 上直接失败。这里只剔除指向 `$APPDIR` 内部或空值的
+/// 条目：用户自配的 venv 与桌面端注入的条目原样保留，`$APPDIR` 缺省或为空（非
+/// AppImage 运行）时整体不介入。
+///
+/// 返回 `None` 表示不改动该变量；`Some(None)` 表示从子进程环境里移除它。
+pub(crate) fn appimage_python_env(
+    appdir: Option<&std::ffi::OsStr>,
+    name: &str,
+    value: Option<&std::ffi::OsStr>,
+) -> Option<Option<std::ffi::OsString>> {
+    let appdir = appdir.filter(|path| !path.is_empty())?;
+    let value = value?;
+    if value.is_empty() {
+        log::info!("{name} is empty, dropped for child processes");
+        return Some(None);
+    }
+    let kept = std::env::join_paths(
+        std::env::split_paths(value).filter(|path| !path.starts_with(Path::new(appdir))),
+    )
+    .expect("split path lists contain no path separator");
+    if kept.is_empty() {
+        log::info!("{name} resolved only inside $APPDIR, dropped for child processes");
+        return Some(None);
+    }
+    if kept != value {
+        log::info!(
+            "{name} keeps only the entries outside $APPDIR: {}",
+            kept.to_string_lossy()
+        );
+    }
+    Some(Some(kept))
+}
+
 #[cfg(test)]
 mod tests {
+    use super::appimage_python_env;
     #[cfg(target_os = "linux")]
     use super::child_library_path;
     use super::decode_process_line;
     #[cfg(windows)]
     use super::{decode_multibyte, encode_multibyte, short_path};
+
+    mod appimage_python {
+        use super::appimage_python_env;
+        use std::ffi::{OsStr, OsString};
+
+        #[test]
+        fn drops_home_pointing_into_the_mount() {
+            assert_eq!(
+                appimage_python_env(
+                    Some(OsStr::new("/tmp/.mount_DSH")),
+                    "PYTHONHOME",
+                    Some(OsStr::new("/tmp/.mount_DSH/usr")),
+                ),
+                Some(None),
+            );
+        }
+
+        #[test]
+        fn drops_an_empty_value() {
+            for value in ["", "/tmp/.mount_DSH/usr:/tmp/.mount_DSH/usr/lib"] {
+                assert_eq!(
+                    appimage_python_env(
+                        Some(OsStr::new("/tmp/.mount_DSH")),
+                        "PYTHONPATH",
+                        Some(OsStr::new(value)),
+                    ),
+                    Some(None),
+                    "{value}",
+                );
+            }
+        }
+
+        /// 多条目列表按平台分隔符拆分，只有 Linux 的 `:` 语义能表达 AppImage 现场。
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn keeps_user_paths_while_dropping_mount_entries() {
+            assert_eq!(
+                appimage_python_env(
+                    Some(OsStr::new("/tmp/.mount_DSH")),
+                    "PYTHONPATH",
+                    Some(OsStr::new(
+                        "/home/u/venv/lib:/tmp/.mount_DSH/usr/lib/python:relative/site",
+                    )),
+                ),
+                Some(Some(OsString::from("/home/u/venv/lib:relative/site"))),
+            );
+            assert_eq!(
+                appimage_python_env(
+                    Some(OsStr::new("/tmp/.mount_DSH")),
+                    "PYTHONPATH",
+                    Some(OsStr::new("/tmp/.mount_DSH-other/lib")),
+                ),
+                Some(Some(OsString::from("/tmp/.mount_DSH-other/lib"))),
+            );
+        }
+
+        #[test]
+        fn keeps_sibling_directories_sharing_the_mount_prefix() {
+            assert_eq!(
+                appimage_python_env(
+                    Some(OsStr::new("/tmp/.mount_DSH")),
+                    "PYTHONHOME",
+                    Some(OsStr::new("/tmp/.mount_DSH-other/lib")),
+                ),
+                Some(Some(OsString::from("/tmp/.mount_DSH-other/lib"))),
+            );
+        }
+
+        /// 路径必须原样往返，非 UTF-8 字节不能被解码改写（Linux 上才可能出现）。
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn keeps_non_utf8_user_entries() {
+            use std::os::unix::ffi::{OsStrExt, OsStringExt};
+            assert_eq!(
+                appimage_python_env(
+                    Some(OsStr::new("/tmp/.mount_DSH")),
+                    "PYTHONPATH",
+                    Some(std::ffi::OsStr::from_bytes(
+                        b"/opt/\xff/lib:/tmp/.mount_DSH/usr/lib",
+                    )),
+                ),
+                Some(Some(OsString::from_vec(b"/opt/\xff/lib".to_vec()))),
+            );
+        }
+
+        #[test]
+        fn ignores_runs_outside_an_appimage() {
+            for appdir in [None, Some(OsStr::new(""))] {
+                for value in [None, Some(OsStr::new("/tmp/.mount_DSH/usr"))] {
+                    assert_eq!(
+                        appimage_python_env(appdir, "PYTHONHOME", value),
+                        None,
+                        "{appdir:?} {value:?}",
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn ignores_an_unset_value() {
+            assert_eq!(
+                appimage_python_env(Some(OsStr::new("/tmp/.mount_DSH")), "PYTHONHOME", None),
+                None,
+            );
+        }
+    }
 
     #[cfg(target_os = "linux")]
     mod appimage_library_path {

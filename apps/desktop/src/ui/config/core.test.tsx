@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import type { HarnessCore } from '@/types'
+import type { DependenciesRootPreview, DependenciesRootStatus, HarnessCore } from '@/types'
 import { OverlaysProvider } from '@overlastic/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
@@ -55,6 +55,18 @@ let updateVersion: string
 let updateError: string | Error | null
 let coreAsar: boolean
 let coreAsarError: string | Error | null
+let depsRoot: DependenciesRootStatus
+let depsPreview: DependenciesRootPreview
+let depsPick: string | null
+let depsMigrateError: string | Error | null
+
+let dialogsOpened = 0
+
+/** 打开确认框；登记次数好让 afterEach 知道要等 overlastic 的消失延迟落定 */
+function findDialog() {
+  dialogsOpened += 1
+  return screen.findByRole('alertdialog')
+}
 
 function renderCore() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
@@ -93,6 +105,22 @@ beforeEach(async () => {
   updateError = null
   coreAsar = true
   coreAsarError = null
+  depsRoot = {
+    root: 'C:\\Users\\me\\AppData\\Roaming\\dsh-tauri\\dependencies',
+    defaultRoot: 'C:\\Users\\me\\AppData\\Roaming\\dsh-tauri\\dependencies',
+    custom: false,
+    movable: true,
+  }
+  depsPreview = {
+    source: depsRoot.root,
+    target: 'D:\\DSH deps',
+    totalFiles: 120,
+    totalBytes: 1024 * 1024 * 1024,
+    targetFreeBytes: 200 * 1024 * 1024 * 1024,
+    enoughSpace: true,
+  }
+  depsPick = 'D:\\DSH deps'
+  depsMigrateError = null
   translations = createInstance()
   await translations.init({
     lng: 'en-US',
@@ -106,6 +134,18 @@ beforeEach(async () => {
       return cores.map(core => ({ ...core }))
     if (command === 'get_core_asar')
       return coreAsar
+    if (command === 'get_dependencies_root_status')
+      return { ...depsRoot }
+    if (command === 'pick_dependencies_root')
+      return depsPick
+    if (command === 'preview_dependencies_root_migration')
+      return { ...depsPreview }
+    if (command === 'migrate_dependencies_root') {
+      if (depsMigrateError)
+        throw depsMigrateError
+      depsRoot = { ...depsRoot, root: args?.path as string, custom: true }
+      return { source: depsPreview.source, target: args?.path, movedTo: '', files: 120, bytes: 2048 }
+    }
     if (command === 'set_core_asar') {
       if (coreAsarError)
         throw coreAsarError
@@ -126,7 +166,13 @@ beforeEach(async () => {
   })
 })
 
-afterEach(() => {
+afterEach(async () => {
+  // overlastic 关闭对话框后有 300ms 消失延迟，定时器必须在本文件的 jsdom 环境销毁前
+  // 落定，否则它的 setState 会在下一个测试文件里执行并撞上 window 未定义（CI 上
+  // 稳定复现，本地因时序恰好不触发）。只有真正开过对话框的用例才付这份等待。
+  if (dialogsOpened > 0)
+    await new Promise<void>(resolve => setTimeout(resolve, 400))
+  dialogsOpened = 0
   cleanup()
   for (const client of clients)
     client.clear()
@@ -178,7 +224,7 @@ describe('核心激活兼容性', () => {
     expect((checkbox as HTMLInputElement).disabled).toBe(false)
     fireEvent.click(target === 'row' ? screen.getByText('0.2.2-rc.2') : checkbox)
 
-    const dialog = await screen.findByRole('alertdialog')
+    const dialog = await findDialog()
     fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm' }))
 
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('set_active_core', { id: managedFixture.id }))
@@ -288,7 +334,7 @@ describe('本地核心更新档案安全', () => {
     const updatedLocal = await screen.findByRole('checkbox', { name: '0.2.2' })
     fireEvent.click(updatedLocal)
 
-    const dialog = await screen.findByRole('alertdialog')
+    const dialog = await findDialog()
     expect(within(dialog).queryByRole('textbox')).toBeNull()
     expect(within(dialog).getByRole('heading').textContent).toBe('Switch version')
     expectNoCoreOrProfileSwitch()
@@ -325,7 +371,7 @@ describe('核心格式（ASAR）开关', () => {
     const toggle = await openAdvanced()
     fireEvent.click(toggle)
 
-    const dialog = await screen.findByRole('alertdialog')
+    const dialog = await findDialog()
     expect(within(dialog).getByRole('heading').textContent).toBe(enUS['core.asar_confirm_title'])
     const description = enUS['core.asar_confirm_desc']
     expect(within(dialog).getByText(description).textContent).toBe(description)
@@ -347,7 +393,7 @@ describe('核心格式（ASAR）开关', () => {
     const toggle = await openAdvanced()
     fireEvent.click(toggle)
 
-    const dialog = await screen.findByRole('alertdialog')
+    const dialog = await findDialog()
     fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
 
     await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull())
@@ -365,16 +411,119 @@ describe('核心格式（ASAR）开关', () => {
     expect((toggle as HTMLButtonElement).disabled).toBe(true)
   })
 
+  it('本地核心生效时禁用 ASAR 开关', async () => {
+    cores = [{ ...localFixture, active: true }, { ...managedFixture, active: false }]
+    renderCore()
+    fireEvent.click(await screen.findByRole('switch', { name: 'Advanced options' }))
+    expect((await screen.findByRole('switch', { name: 'ASAR' }) as HTMLInputElement).disabled).toBe(true)
+  })
+
   it('切换失败时提示失败并保留原格式', async () => {
     coreAsarError = 'CORE_ASAR_SWITCH_FAILED: download unavailable'
     const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
     const toggle = await openAdvanced()
     fireEvent.click(toggle)
-    fireEvent.click(within(await screen.findByRole('alertdialog')).getByRole('button', { name: 'Confirm' }))
+    fireEvent.click(within(await findDialog()).getByRole('button', { name: 'Confirm' }))
 
-    await waitFor(() => expect(mocks.toast).toHaveBeenCalledWith('Failed to switch the core format', {}))
+    await waitFor(() => expect(mocks.toast).toHaveBeenCalledWith('Failed to switch the core format', { variant: 'danger', description: coreAsarError }))
     expect(errorLog).toHaveBeenCalledWith('[ConfigCore] switch core format failed:', coreAsarError)
     expect(mocks.restart).not.toHaveBeenCalled()
     expect((toggle as HTMLInputElement).checked).toBe(true)
+  })
+})
+
+describe('核心目录（依赖根）迁移', () => {
+  async function openAdvanced(): Promise<HTMLButtonElement> {
+    renderCore()
+    fireEvent.click(await screen.findByRole('switch', { name: 'Advanced options' }))
+    const change = await screen.findByRole('button', { name: enUS['core.deps_root_change'] }) as HTMLButtonElement
+    await waitFor(() => expect(change.disabled).toBe(false))
+    return change
+  }
+
+  it('高级选项里显示当前核心目录与「更改路径」入口', async () => {
+    renderCore()
+    expect(screen.queryByRole('button', { name: enUS['core.deps_root_change'] })).toBeNull()
+
+    fireEvent.click(await screen.findByRole('switch', { name: 'Advanced options' }))
+
+    expect(await screen.findByText(depsRoot.root)).toBeTruthy()
+    expect(screen.getByText(enUS['core.deps_root'])).toBeTruthy()
+  })
+
+  it('确认后迁移核心目录、提示成功并重启服务', async () => {
+    const change = await openAdvanced()
+    fireEvent.click(change)
+
+    const dialog = await findDialog()
+    expect(within(dialog).getByRole('heading').textContent).toBe(enUS['core.deps_root_confirm_title'])
+    expect(mocks.invoke).not.toHaveBeenCalledWith('migrate_dependencies_root', expect.anything())
+
+    fireEvent.click(within(dialog).getByRole('button', { name: enUS['core.deps_root_confirm'] }))
+
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('preview_dependencies_root_migration', { path: depsPick }))
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('migrate_dependencies_root', { path: depsPick }))
+    await waitFor(() => expect(mocks.toast).toHaveBeenCalledWith(enUS['core.deps_root_migrated_toast'], { variant: 'success' }))
+    await waitFor(() => expect(mocks.restart).toHaveBeenCalledTimes(1))
+  })
+
+  it('取消确认框不迁移也不重启', async () => {
+    const change = await openAdvanced()
+    fireEvent.click(change)
+
+    fireEvent.click(within(await findDialog()).getByRole('button', { name: 'Cancel' }))
+
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull())
+    expect(mocks.invoke).not.toHaveBeenCalledWith('migrate_dependencies_root', expect.anything())
+    expect(mocks.restart).not.toHaveBeenCalled()
+  })
+
+  it('选目录被取消时不弹确认框、不迁移', async () => {
+    depsPick = null
+    const change = await openAdvanced()
+    fireEvent.click(change)
+
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('pick_dependencies_root'))
+    expect(screen.queryByRole('alertdialog')).toBeNull()
+    expect(mocks.invoke).not.toHaveBeenCalledWith('migrate_dependencies_root', expect.anything())
+    expect(mocks.restart).not.toHaveBeenCalled()
+  })
+
+  it('目标磁盘空间不足时拒绝迁移并说明缺口', async () => {
+    depsPreview = { ...depsPreview, enoughSpace: false, targetFreeBytes: 1024 }
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const change = await openAdvanced()
+    fireEvent.click(change)
+    fireEvent.click(within(await findDialog()).getByRole('button', { name: enUS['core.deps_root_confirm'] }))
+
+    await waitFor(() => expect(mocks.toast).toHaveBeenCalledWith(enUS['core.deps_root_migrate_failed'], expect.objectContaining({ variant: 'danger' })))
+    expect(mocks.invoke).not.toHaveBeenCalledWith('migrate_dependencies_root', expect.anything())
+    expect(mocks.restart).not.toHaveBeenCalled()
+    expect(errorLog).toHaveBeenCalled()
+  })
+
+  it('迁移失败时提示失败且不重启', async () => {
+    depsMigrateError = 'DEPS_ROOT_RETIRE_RENAME: locked'
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const change = await openAdvanced()
+    fireEvent.click(change)
+    fireEvent.click(within(await findDialog()).getByRole('button', { name: enUS['core.deps_root_confirm'] }))
+
+    await waitFor(() => expect(mocks.toast).toHaveBeenCalledWith(enUS['core.deps_root_migrate_failed'], {
+      variant: 'danger',
+      description: depsMigrateError,
+    }))
+    expect(errorLog).toHaveBeenCalledWith('[ConfigCore] migrate dependencies root failed:', depsMigrateError)
+    expect(mocks.restart).not.toHaveBeenCalled()
+  })
+
+  it('由安装包或包管理器管理的核心目录不可迁移', async () => {
+    depsRoot = { ...depsRoot, movable: false }
+    renderCore()
+    fireEvent.click(await screen.findByRole('switch', { name: 'Advanced options' }))
+
+    const change = await screen.findByRole('button', { name: enUS['core.deps_root_change'] }) as HTMLButtonElement
+    expect(change.disabled).toBe(true)
+    expect(screen.getByText(enUS['core.deps_root_locked'])).toBeTruthy()
   })
 })
